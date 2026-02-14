@@ -1,0 +1,1848 @@
+
+--- START FILE: config.py ---
+
+# Static RAG Hyperparameters
+
+# Embedding model (384 dimensions)
+EMBED_MODEL = "all-MiniLM-L6-v2"
+
+# RAG Hyperparameters
+CHUNK_SIZE = 800      # Optimized for code analysis
+CHUNK_OVERLAP = 150   # Overlap helps maintain context
+TOP_K = 5             # Number of relevant chunks to retrieve
+
+--- END FILE: config.py ---
+
+--- START FILE: config_manager.py ---
+
+import json
+import os
+from models import DEFAULT_MODEL
+from themes import DEFAULT_THEME
+
+CONFIG_FILE = "data/config.json"
+
+class ConfigManager:
+    def __init__(self):
+        os.makedirs("data", exist_ok=True)
+        os.makedirs("data/chats", exist_ok=True)
+        self.config = self._load()
+
+    def _load(self):
+        """Loads configuration from the local file."""
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                pass # Return default if file is corrupted
+        
+        # Default structure
+        return {
+            "api_keys": [],
+            "current_model": DEFAULT_MODEL,
+            "current_theme": DEFAULT_THEME,
+            "active_chat_id": None,
+        }
+
+    def _save(self):
+        """Saves current configuration to the local file."""
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config, f, indent=4)
+
+    # --- API Key Management ---
+    def get_keys(self):
+        return self.config.get("api_keys", [])
+
+    def add_key(self, key):
+        if key not in self.config["api_keys"]:
+            self.config["api_keys"].append(key)
+            self._save()
+
+    def remove_key(self, key):
+        if key in self.config["api_keys"]:
+            self.config["api_keys"].remove(key)
+            self._save()
+
+    # --- Model Management ---
+    def get_current_model(self):
+        return self.config.get("current_model", DEFAULT_MODEL)
+
+    def set_current_model(self, model_name):
+        self.config["current_model"] = model_name
+        self._save()
+
+    # --- Theme Management ---
+    def get_current_theme(self):
+        return self.config.get("current_theme", DEFAULT_THEME)
+
+    def set_current_theme(self, theme_name):
+        self.config["current_theme"] = theme_name
+        self._save()
+
+    # --- Chat Management ---
+    def get_active_chat_id(self):
+        return self.config.get("active_chat_id")
+
+    def set_active_chat_id(self, chat_id):
+        self.config["active_chat_id"] = chat_id
+        self._save()
+
+# Instance shared across the application
+config_manager = ConfigManager()
+
+--- END FILE: config_manager.py ---
+
+--- START FILE: main(old app).py ---
+
+import os
+
+from textual.app import App, ComposeResult
+from textual.widgets import Header, Footer, Input, Button, Static, Label, Select
+from textual.containers import Container, VerticalScroll
+from textual.widget import Widget
+from textual.message import Message
+from textual.reactive import reactive
+from textual.widgets import Markdown, ContentSwitcher
+
+import asyncio
+from config_manager import config_manager
+from llm.gemini_client import GeminiClient
+from retrieval.retriever import Retriever
+from memory.chat_memory import ChatMemory
+from indexing.code_indexer import CodeIndexer
+from models import MODEL_OPTIONS, DEFAULT_MODEL
+
+# --- Custom Widgets and Screens ---
+
+class ChatBubble(Static):
+    """A widget for displaying a single chat message."""
+    
+    def __init__(self, role: str, content: str, **kwargs):
+        super().__init__(**kwargs)
+        self.role = role
+        self.content = content
+        self.styles.width = "auto"
+        self.styles.padding = (0, 2)
+        
+    def compose(self) -> ComposeResult:
+        if self.role == "user":
+            self.styles.content_align_horizontal = "right"
+            self.styles.color = "yellow"
+        else:
+            self.styles.content_align_horizontal = "left"
+            self.styles.color = "white"
+
+        # Use the Textual Markdown widget for seamless rendering and copying
+        yield Markdown(self.content, classes=f"{self.role}-bubble")
+        
+        # Optional: Add a copy button for better UX (requires more advanced Textual binding)
+        # For simplicity, Markdown widget already allows selection and copy-paste in most terminals.
+
+
+class ChatView(VerticalScroll):
+    """The scrollable area for chat history."""
+    pass
+
+class SetupScreen(Container):
+    """Screen for initial API key and model setup."""
+    
+    def compose(self) -> ComposeResult:
+        yield Label("[bold red]API Key and Model Setup[/bold red]", classes="title")
+        yield Input(placeholder="Enter Gemini API Key", id="key_input", classes="input")
+        yield Button("Add Key", id="add_key_btn", variant="primary")
+        yield Static("", id="key_list_status")
+        yield Label("\n[bold]Current Model:[/bold]")
+        yield Select(
+            [(name, value) for name, value in MODEL_OPTIONS.items()],
+            prompt="Select Model",
+            value=config_manager.get_current_model(),
+            id="model_select"
+        )
+        yield Button("Save & Start Chat", id="start_chat_btn", variant="success", disabled=True)
+
+    def on_mount(self) -> None:
+        """Called once the widget and its children are mounted and ready."""
+        self.update_status()
+
+    def update_status(self):
+        """Refreshes the list of stored keys."""
+        keys = config_manager.get_keys()
+        status_widget = self.query_one("#key_list_status", Static)
+        
+        if keys:
+            status_text = "[bold green]Stored Keys:[/bold green]\n"
+            for i, key in enumerate(keys):
+                status_text += f"  - Key {i+1} (ends in ...{key[-4:]})\n"
+            self.query_one("#start_chat_btn", Button).disabled = False
+        else:
+            status_text = "[bold yellow]No API keys stored. Please add one to start.[/bold yellow]"
+            self.query_one("#start_chat_btn", Button).disabled = True
+            
+        status_widget.update(status_text)
+        
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "add_key_btn":
+            key_input = self.query_one("#key_input", Input)
+            key = key_input.value.strip()
+            if key and key.startswith("AIza"):
+                config_manager.add_key(key)
+                key_input.value = ""
+                self.update_status()
+            else:
+                self.app.bell()
+
+        elif event.button.id == "start_chat_btn":
+            # Pass the signal to the main app to initialize and switch screen
+            self.app.post_message(StartChat())
+
+    def on_select_changed(self, event: Select.Changed):
+        config_manager.set_current_model(event.value)
+
+# --- Messages for Inter-widget Communication ---
+
+class StartChat(Message):
+    """Sent when setup is complete and chat should begin."""
+    pass
+
+class StatusUpdate(Message):
+    """Sent to update the index/API status."""
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+# --- Main Application ---
+
+class RAGCoderApp(App):
+    CSS = """
+    #chat_container {
+        height: 100%;
+    }
+    #output_area {
+        height: 90%;
+        border: solid #333;
+        padding: 1 2;
+    }
+    #input_area {
+        height: 10%;
+        padding: 0 1;
+        align: left middle;
+    }
+    #command_input {
+        width: 80%;
+    }
+    .user-bubble, .assistant-bubble {
+        margin-bottom: 1;
+        width: 100%;
+    }
+    .title {
+        text-align: center;
+        margin-bottom: 2;
+    }
+    .input {
+        width: 100%;
+        margin-bottom: 1;
+    }
+    """
+    
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("ctrl+i", "show_index_prompt", "Index Codebase"),
+        ("ctrl+s", "show_setup", "Manage Keys/Model")
+    ]
+    
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.config_manager = config_manager
+        self.gemini = None
+        self.retriever = None
+        self.memory = None
+        self.indexer = CodeIndexer()
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+        yield ContentSwitcher(initial="setup_screen", id="screen_switcher")
+        
+        # Initial Setup Screen
+        yield SetupScreen(id="setup_screen")
+        
+        # Main Chat Screen (will be loaded dynamically after setup)
+        with Container(id="chat_container", classes="full-screen"):
+            yield Static("Status: Ready.", id="status_bar")
+            yield ChatView(id="output_area")
+            with Container(id="input_area"):
+                yield Input(placeholder="Ask a coding question or enter command (Ctrl+I to Index)", id="command_input")
+                yield Button("Send", id="send_btn", variant="primary")
+
+    def on_mount(self):
+        # Check if keys exist on mount; if so, skip setup screen
+        if self.config_manager.get_keys():
+            self.initialize_rag()
+            self.query_one("#screen_switcher").current = "chat_container"
+        else:
+            self.query_one("#screen_switcher").current = "setup_screen"
+
+    def initialize_rag(self):
+        """Initializes the LLM, Retriever, and Memory components."""
+        self.gemini = GeminiClient()
+        self.retriever = Retriever()
+        self.memory = ChatMemory()
+        
+        # Check if index exists
+        if not self.indexer.store.texts:
+            self.post_message(StatusUpdate("[bold yellow]Codebase index is empty. Use Ctrl+I to index your repository.[/bold yellow]"))
+        else:
+            self.post_message(StatusUpdate(f"[bold green]LLM and RAG Ready.[/bold green] Model: {self.gemini.model_name}. Chunks: {len(self.indexer.store.texts)}"))
+
+
+    # --- Textual Event Handlers ---
+    
+    def on_start_chat(self, message: StartChat):
+        """Handles the transition from setup to chat screen."""
+        self.initialize_rag()
+        self.query_one("#screen_switcher").current = "chat_container"
+
+    def action_show_setup(self):
+        """Opens the setup screen to manage keys/models."""
+        self.query_one("#screen_switcher").current = "setup_screen"
+        self.query_one("#setup_screen", SetupScreen).update_status()
+
+    def action_show_index_prompt(self):
+        """Prompts the user for the path to index."""
+        # Replace the input box temporarily with an indexing prompt
+        self.post_message(StatusUpdate("Enter the absolute path to your codebase in the chat box and hit Enter."))
+        self.query_one("#command_input", Input).value = "!index "
+
+    def on_button_pressed(self, event: Button.Pressed):
+        if event.button.id == "send_btn":
+            self.submit_query()
+            
+    def on_input_submitted(self, event: Input.Submitted):
+        if event.input.id == "command_input":
+            self.submit_query()
+
+    def submit_query(self):
+        query = self.query_one("#command_input", Input).value.strip()
+        self.query_one("#command_input", Input).value = ""
+        
+        if not query:
+            return
+
+        # 1. Handle commands
+        if query.lower().startswith("!index"):
+            _, path = query.split(maxsplit=1)
+            self.handle_index(path.strip())
+            return
+            
+        if self.gemini is None:
+            self.post_message(StatusUpdate("[bold red]ERROR:[/bold red] RAG system not initialized. Check API keys."))
+            return
+
+        # 2. Add user bubble instantly
+        chat_view = self.query_one("#output_area", ChatView)
+        chat_view.mount(ChatBubble("user", query))
+        chat_view.scroll_end()
+        self.memory.save("user", query)
+
+        # 3. Handle RAG and Generation in background thread
+        self.run_worker(self.process_rag(query))
+
+    async def process_rag(self, query: str):
+        """Asynchronous worker to handle RAG pipeline and LLM call."""
+        self.post_message(StatusUpdate("[bold blue]Retrieving context and generating response...[/bold blue]"))
+
+        # 1. Retrieval
+        retrieved_context = self.retriever.retrieve(query)
+        history = self.memory.load()
+        prompt = build_rag_prompt(query, retrieved_context, history)
+
+        # 2. Generation (Blocking call needs to be run in executor)
+        try:
+            answer = await self.app.run_in_executor(self.gemini.generate, prompt)
+        except Exception as e:
+            answer = f"**[AI GENERATION ERROR]** Failed to generate response: {e}"
+        
+        # 3. Update UI
+        chat_view = self.query_one("#output_area", ChatView)
+        chat_view.mount(ChatBubble("assistant", answer))
+        chat_view.scroll_end()
+        self.memory.save("assistant", answer)
+        
+        self.post_message(StatusUpdate("[bold green]Response ready.[/bold green]"))
+
+
+    def handle_index(self, path: str):
+        """Handles the codebase indexing process asynchronously."""
+        self.post_message(StatusUpdate(f"[bold yellow]Starting indexing of {path}. This may take a moment...[/bold yellow]"))
+        self.run_worker(self.run_index_process(path))
+
+    async def run_index_process(self, path: str):
+        try:
+            await self.app.run_in_executor(self.indexer.index_directory, path)
+            self.post_message(StatusUpdate(f"[bold green]Indexing successful![/bold green] Total chunks: {len(self.indexer.store.texts)}"))
+        except Exception as e:
+            self.post_message(StatusUpdate(f"[bold red]INDEXING FAILED:[/bold red] {e}"))
+
+    def on_status_update(self, message: StatusUpdate):
+        self.query_one("#status_bar", Static).update(message.message)
+
+
+if __name__ == "__main__":
+    # Ensure data directory exists
+    os.makedirs("data", exist_ok=True)
+    
+    # We must redefine build_rag_prompt here or import it from the old main.py 
+    # For simplicity in this answer, let's include the definition here.
+    def build_rag_prompt(query, retrieved_context, history):
+        system_instruction = (
+            "You are an expert software engineer and AI coding assistant. "
+            "Your primary goal is to analyze the provided code context and "
+            "conversation history to solve the user's coding problems, explain concepts, "
+            "refactor code, or fix bugs. Be concise, accurate, and use proper Markdown for code blocks."
+        )
+
+        history_str = "\n".join(
+            f"[{msg['role'].upper()}]: {msg['content']}" for msg in history
+        )
+        context_str = "\n---\n".join(retrieved_context)
+
+        prompt = f"""
+{system_instruction}
+
+---
+[START CONTEXT]
+The following code snippets are relevant to the user's request. Each chunk is prefixed 
+with the file path it originated from. Use this information judiciously to answer the query.
+
+{context_str or "No relevant code context was retrieved from the codebase."}
+[END CONTEXT]
+---
+
+[CONVERSATION HISTORY]
+{history_str or "No previous conversation history."}
+---
+
+[USER QUESTION]
+{query}
+"""
+        return prompt
+
+    app = RAGCoderApp()
+    app.run()
+
+--- END FILE: main(old app).py ---
+
+--- START FILE: main_gui.py ---
+
+import sys
+import os
+import shutil 
+import glob
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, 
+    QHBoxLayout, QLineEdit, QPushButton, QScrollArea, 
+    QMenuBar, QMenu, QStatusBar, QMessageBox, QFileDialog, 
+    QListWidget, QListWidgetItem, QComboBox, QLabel, QSplitter
+)
+from PySide6.QtCore import Qt, QThread, Signal, QSize
+from PySide6.QtGui import QIcon
+from concurrent.futures import ThreadPoolExecutor
+
+# Import RAG components
+from llm.gemini_client import GeminiClient
+from retrieval.retriever import Retriever
+from memory.chat_memory import ChatMemory, MEMORY_DIR, CHAT_META_FILE
+from indexing.code_indexer import CodeIndexer
+from config_manager import config_manager
+from gui.chat_widget import ChatViewWidget
+from gui.setup_dialog import SetupDialog
+from themes import THEMES, DEFAULT_THEME # NEW IMPORT
+
+# Ensure data directory exists
+os.makedirs("data", exist_ok=True)
+os.makedirs(MEMORY_DIR, exist_ok=True) # Ensure chats directory exists
+
+# Global executor for background tasks
+executor = ThreadPoolExecutor(max_workers=5)
+
+# --- Threading Classes (RAGWorker and IndexWorker remain identical) ---
+class RAGWorker(QThread):
+    finished = Signal(str, str) 
+    error = Signal(str)
+    status = Signal(str)
+    
+    def __init__(self, query, gemini, retriever, memory, prompt_builder):
+        super().__init__()
+        self.query = query
+        self.gemini = gemini
+        self.retriever = retriever
+        self.memory = memory
+        self.prompt_builder = prompt_builder
+
+    def run(self):
+        try:
+            self.status.emit("Retrieving context and generating response...")
+            retrieved_context = self.retriever.retrieve(self.query)
+            history = self.memory.load()
+            prompt = self.prompt_builder(self.query, retrieved_context, history)
+            answer = self.gemini.generate(prompt)
+            self.memory.save("assistant", answer)
+            self.finished.emit("assistant", answer)
+            self.status.emit("Response ready.")
+        except Exception as e:
+            self.error.emit(f"AI Error: {e}")
+            self.status.emit("Error generating response.")
+
+class IndexWorker(QThread):
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, path, indexer):
+        super().__init__()
+        self.path = path
+        self.indexer = indexer
+
+    def run(self):
+        try:
+            self.indexer.index_directory(self.path) 
+            self.finished.emit(f"Indexing successful! Total chunks: {len(self.indexer.store.texts)}")
+        except Exception as e:
+            self.error.emit(f"Indexing Failed: {e}")
+
+# --- Main Application Window ---
+
+class RAGCoderWindow(QMainWindow):
+    # Signals for UI updates from workers
+    rag_finished_signal = Signal(str, str) 
+    rag_error_signal = Signal(str)
+    status_update_signal = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("RAG Coding Assistant (Gemini)")
+        self.resize(1400, 800) 
+        
+        self.gemini = None
+        self.retriever = None
+        self.memory = ChatMemory() # Initialize memory first
+        self.indexer = CodeIndexer()
+        
+        # Connect proxy signals to slots
+        self.rag_finished_signal.connect(self._rag_finished)
+        self.rag_error_signal.connect(self._rag_error)
+        
+        self._setup_rag() # Configure RAG components
+        self._setup_ui()
+        self.apply_theme(config_manager.get_current_theme()) # Apply saved theme
+
+    # --- UI Setup ---
+
+    def _setup_ui(self):
+        self._create_menu()
+        self.status_bar = self.statusBar() # Use standard status bar
+        self.status_update_signal.connect(self.status_bar.showMessage) # Connect status signal here
+
+        # Main Splitter: Sidebar and Main Content
+        main_splitter = QSplitter(Qt.Horizontal)
+        self.setCentralWidget(main_splitter)
+        
+        # 1. Sidebar Setup
+        self.sidebar = self._create_sidebar()
+        main_splitter.addWidget(self.sidebar)
+        
+        # 2. Main Chat Area Setup
+        chat_area = QWidget()
+        chat_layout = QVBoxLayout(chat_area)
+        chat_layout.setContentsMargins(0, 0, 0, 0)
+        chat_layout.setSpacing(0)
+        
+        self.chat_view = ChatViewWidget()
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(self.chat_view)
+        
+        chat_layout.addWidget(self.scroll_area)
+        chat_layout.addWidget(self._create_input_area())
+        
+        main_splitter.addWidget(chat_area)
+        
+        # Set initial splitter size (Sidebar width: 250px)
+        main_splitter.setSizes([250, 1150])
+
+        # Load history for the active chat
+        self._load_chat_history()
+
+    def _create_sidebar(self):
+        sidebar = QWidget()
+        sidebar.setObjectName("sidebar_container")
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # New Chat Button
+        new_chat_btn = QPushButton("✨ New Chat")
+        new_chat_btn.setObjectName("new_chat_btn")
+        new_chat_btn.clicked.connect(self._new_chat_session)
+        layout.addWidget(new_chat_btn)
+
+        # Chat List
+        layout.addWidget(QLabel("<b>Chat History</b>:"))
+        self.chat_list = QListWidget()
+        self.chat_list.setObjectName("chat_list_widget")
+        self.chat_list.itemClicked.connect(self._switch_chat_session)
+        self.chat_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.chat_list.customContextMenuRequested.connect(self._show_chat_context_menu)
+        layout.addWidget(self.chat_list)
+        
+        self._refresh_chat_list()
+        
+        # Theme Selector
+        layout.addWidget(QLabel("<b>Coding Theme</b>:"))
+        self.theme_combo = QComboBox()
+        for name in THEMES.keys():
+            self.theme_combo.addItem(name, name)
+        self.theme_combo.setCurrentText(config_manager.get_current_theme())
+        self.theme_combo.currentTextChanged.connect(self.apply_theme)
+        layout.addWidget(self.theme_combo)
+
+        # Space filler
+        layout.addStretch(1)
+
+        # Clear Chat Button (Clears current conversation)
+        clear_chat_btn = QPushButton("Clear Current Chat")
+        clear_chat_btn.clicked.connect(self._clear_active_chat)
+        layout.addWidget(clear_chat_btn)
+
+        # Delete ALL Chats Button
+        delete_all_chats_btn = QPushButton("Delete ALL Chats")
+        delete_all_chats_btn.setObjectName("delete_all_chats_btn")
+        delete_all_chats_btn.clicked.connect(self._clear_all_chat_history)
+        layout.addWidget(delete_all_chats_btn)
+
+        return sidebar
+
+    def _create_input_area(self):
+        input_container = QWidget()
+        input_container.setObjectName("chat_input_container")
+        input_layout = QHBoxLayout(input_container)
+        input_layout.setContentsMargins(10, 10, 10, 10)
+        
+        self.input_field = QLineEdit()
+        self.input_field.setPlaceholderText("Enter command or coding question...")
+        self.input_field.returnPressed.connect(self._handle_input)
+        
+        self.send_button = QPushButton("Send")
+        self.send_button.setObjectName("send_button")
+        self.send_button.clicked.connect(self._handle_input)
+        
+        input_layout.addWidget(self.input_field)
+        input_layout.addWidget(self.send_button)
+        return input_container
+
+    def _create_menu(self):
+        menu_bar = QMenuBar()
+        
+        settings_menu = QMenu("&Settings", self)
+        key_action = settings_menu.addAction("Manage API Keys & Model")
+        key_action.triggered.connect(self._show_setup_dialog)
+
+        data_menu = QMenu("&Data Management", self)
+        index_action = data_menu.addAction("Index New Codebase...")
+        index_action.triggered.connect(self._prompt_for_indexing)
+        
+        clear_all_action = data_menu.addAction("💣 Clear ALL Application Data")
+        clear_all_action.triggered.connect(self._clear_all_data)
+        
+        help_menu = QMenu("&Help", self)
+        docs_action = help_menu.addAction("About RAG Coder")
+        docs_action.triggered.connect(lambda: QMessageBox.information(self, "About", "RAG Coding Assistant powered by Gemini and FAISS.\nUI Framework: PySide6\nIndex Engine: FAISS"))
+        
+        menu_bar.addMenu(settings_menu)
+        menu_bar.addMenu(data_menu)
+        menu_bar.addMenu(help_menu)
+        self.setMenuBar(menu_bar)
+
+    # --- Theme Management ---
+    
+    def apply_theme(self, theme_name: str):
+        """Applies the selected QSS theme to the entire application."""
+        if theme_name in THEMES:
+            self.setStyleSheet(THEMES[theme_name]["QSS"])
+            config_manager.set_current_theme(theme_name)
+            
+            # Ensure chat bubbles are re-rendered with new background colors
+            self.chat_view.refresh_view(self.memory.load())
+
+    # --- Chat Management Logic ---
+    
+    def _refresh_chat_list(self):
+        """Populates the sidebar chat list."""
+        self.chat_list.clear()
+        chats = self.memory.get_all_chats()
+        active_id = self.memory.active_chat_id
+        
+        # Display chats sorted by key (simple alphabetical for now)
+        for chat_id, name in chats.items():
+            item = QListWidgetItem(name)
+            item.setData(Qt.UserRole, chat_id)
+            if chat_id == active_id:
+                item.setText(f"➤ {name}")
+                self.chat_list.setCurrentItem(item)
+            self.chat_list.addItem(item)
+
+    def _new_chat_session(self):
+        """Creates a new chat and switches to it."""
+        new_id = self.memory.new_chat(f"Chat {len(self.memory.get_all_chats()) + 1}")
+        self._refresh_chat_list()
+        self.chat_view.clear_messages()
+        self.status_update_signal.emit(f"New chat session started: {self.memory.metadata[new_id]}")
+
+    def _switch_chat_session(self, item: QListWidgetItem):
+        """Switches the active chat based on sidebar selection."""
+        chat_id = item.data(Qt.UserRole)
+        if chat_id != self.memory.active_chat_id:
+            try:
+                self.memory.switch_chat(chat_id)
+                self.chat_view.clear_messages()
+                self._load_chat_history()
+                self._refresh_chat_list()
+                self.status_update_signal.emit(f"Switched to chat: {self.memory.metadata[chat_id]}")
+            except ValueError:
+                self.status_update_signal.emit("Error switching chat.")
+
+    def _show_chat_context_menu(self, pos):
+        """Context menu for deleting chats."""
+        item = self.chat_list.itemAt(pos)
+        if item:
+            menu = QMenu(self)
+            delete_action = menu.addAction("Delete Chat")
+            action = menu.exec(self.chat_list.mapToGlobal(pos))
+            
+            if action == delete_action:
+                chat_id = item.data(Qt.UserRole)
+                self._delete_chat_session(chat_id)
+
+    def _delete_chat_session(self, chat_id: str):
+        reply = QMessageBox.question(self, 'Confirm Deletion', 
+                                    f"Are you sure you want to permanently delete chat '{self.memory.metadata.get(chat_id, 'Unknown')}'?", 
+                                    QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            was_active = (chat_id == self.memory.active_chat_id)
+            self.memory.delete_chat(chat_id)
+            
+            self._refresh_chat_list()
+            
+            if was_active:
+                self.chat_view.clear_messages()
+                self._load_chat_history()
+                self.status_update_signal.emit("Chat deleted. Switched to new default session.")
+            else:
+                self.status_update_signal.emit("Chat deleted.")
+
+    def _clear_active_chat(self):
+        """Clears all messages in the currently active chat session."""
+        reply = QMessageBox.question(self, 'Confirm Clear', 
+                                    f"Are you sure you want to clear all messages from the current chat?", 
+                                    QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.memory.clear_active_chat()
+            self.chat_view.clear_messages()
+            self.status_update_signal.emit("Current chat history cleared.")
+
+    def _clear_all_chat_history(self):
+        """Deletes all chat files and metadata, then starts a new default chat."""
+        reply = QMessageBox.critical(self, 'Confirm Deletion', 
+                                    "Are you sure you want to permanently delete ALL saved chat sessions?", 
+                                    QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            try:
+                # 1. Clear config state immediately: This prevents ChatMemory from trying to
+                # reuse a deleted active_chat_id later.
+                config_manager.set_active_chat_id(None)
+                
+                # 2. Remove all chat files and the chat directory structure
+                shutil.rmtree(MEMORY_DIR, ignore_errors=True)
+                os.makedirs(MEMORY_DIR) 
+                
+                # 3. Remove metadata file
+                if os.path.exists(CHAT_META_FILE):
+                    os.remove(CHAT_META_FILE)
+                
+                # 4. Re-initialize memory: this ensures the object starts from a clean disk state, 
+                # creating one new 'Default Chat'.
+                self.memory = ChatMemory() 
+                
+                # 5. Explicitly clear the UI list widget and refresh based on the new memory object
+                self.chat_list.clear() 
+                self.chat_view.clear_messages()
+                self._refresh_chat_list()
+                
+                self.status_update_signal.emit("All chat history deleted. New session created.")
+
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to clear chat history: {e}")
+
+    # --- Data Clearing Management ---
+    
+    def _clear_all_data(self):
+        """Deletes all memory, index, and potentially configuration."""
+        reply = QMessageBox.critical(self, 'DANGER: Clear All Data', 
+            "WARNING: This will permanently delete ALL chat history, the vector index (code knowledge), and reset API key configurations. Are you absolutely sure?", 
+            QMessageBox.Yes | QMessageBox.No)
+            
+        if reply == QMessageBox.Yes:
+            try:
+                # 1. Clear Vector Index Files
+                index_files = ["data/faiss.index", "data/meta.pkl"]
+                for f in index_files:
+                    if os.path.exists(f): os.remove(f)
+                self.indexer = CodeIndexer() # Re-initialize empty index
+                self.retriever = Retriever()
+                
+                # 2. Clear Chat History Files
+                shutil.rmtree(MEMORY_DIR, ignore_errors=True)
+                os.makedirs(MEMORY_DIR)
+                self.memory = ChatMemory() # Re-initialize memory, creating new default chat
+                self._refresh_chat_list()
+                self.chat_view.clear_messages()
+                
+                # 3. Reset Configuration (keep theme/model, clear keys)
+                config_manager.config["api_keys"] = []
+                config_manager._save()
+                self.gemini = None
+                
+                QMessageBox.information(self, "Success", "All application data cleared. Please manage API keys to restart RAG functionality.")
+                self._show_setup_dialog()
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to clear data: {e}")
+
+
+    # --- RAG/Setup/Loading ---
+
+    def _setup_rag(self):
+        """Initializes RAG components based on saved configuration."""
+        keys = config_manager.get_keys()
+        if not keys:
+            self.status_update_signal.emit("SETUP REQUIRED: Please add API keys in Settings menu.")
+            # If no keys on startup, force the setup dialog
+            if not self.gemini: 
+                 self._show_setup_dialog()
+            return
+
+        try:
+            self.gemini = GeminiClient()
+            self.retriever = Retriever()
+            self.status_update_signal.emit(f"RAG Ready. Model: {self.gemini.model_name}. Chunks: {len(self.indexer.store.texts)}")
+        except Exception as e:
+            QMessageBox.critical(self, "RAG Initialization Error", f"Could not initialize Gemini Client: {e}")
+            self.status_update_signal.emit("ERROR: Check API Keys.")
+
+    def _load_chat_history(self):
+        history = self.memory.load()
+        for msg in history:
+            self.chat_view.add_message(msg['role'], msg['content'])
+        self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
+            
+    def _show_setup_dialog(self):
+        dialog = SetupDialog(self)
+        dialog.config_updated.connect(self._setup_rag) 
+        dialog.exec() 
+
+    # --- Command and Worker Management ---
+
+    def _handle_input(self):
+        query = self.input_field.text().strip()
+        self.input_field.clear()
+        
+        if not query: return
+        
+        if query.lower().startswith("!index"):
+            try:
+                _, path = query.split(maxsplit=1)
+                self._start_index_worker(path.strip())
+            except ValueError:
+                self.status_bar.showMessage("Invalid index command. Use: !index <path>")
+            return
+        
+        if not self.gemini or not self.gemini.model:
+            QMessageBox.warning(self, "System Not Ready", "Please configure API keys in Settings.")
+            return
+
+        # 1. Display user message
+        self.chat_view.add_message("user", query)
+        self.memory.save("user", query)
+        self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
+        
+        # 2. Start RAG worker
+        self._start_rag_worker(query)
+
+    def _prompt_for_indexing(self):
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Codebase Directory to Index")
+        if dir_path:
+            self._start_index_worker(dir_path)
+
+    def _start_rag_worker(self, query):
+        self.rag_worker = RAGWorker(query, self.gemini, self.retriever, self.memory, build_rag_prompt)
+        self.rag_worker.finished.connect(self.rag_finished_signal)
+        self.rag_worker.error.connect(self.rag_error_signal)
+        self.rag_worker.status.connect(self.status_update_signal)
+        self.rag_worker.start()
+
+    def _rag_finished(self, role, content):
+        self.chat_view.add_message(role, content)
+        self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
+        
+    def _rag_error(self, message):
+        QMessageBox.critical(self, "Gemini Error", message)
+
+    def _start_index_worker(self, path):
+        self.index_worker = IndexWorker(path, self.indexer)
+        self.index_worker.finished.connect(self._index_finished)
+        self.index_worker.error.connect(self._index_error)
+        self.status_update_signal.emit(f"Indexing started for: {path}")
+        self.index_worker.start()
+
+    def _index_finished(self, message):
+        self.status_update_signal.emit(message)
+        # Re-initialize retriever to recognize new index data
+        self.retriever = Retriever()
+
+    def _index_error(self, message):
+        QMessageBox.critical(self, "Indexing Error", message)
+        self.status_update_signal.emit("Indexing failed.")
+
+# --- Prompt Builder ---
+def build_rag_prompt(query, retrieved_context, history):
+    system_instruction = (
+        "You are an expert software engineer and AI coding assistant. "
+        "Your primary goal is to analyze the provided code context and "
+        "conversation history to solve the user's coding problems, explain concepts, "
+        "refactor code, or fix bugs. Be concise, accurate, and use proper Markdown for code blocks."
+    )
+    history_str = "\n".join(
+        f"[{msg['role'].upper()}]: {msg['content']}" for msg in history
+    )
+    context_str = "\n---\n".join(retrieved_context)
+
+    prompt = f"""{system_instruction}
+--- [START CONTEXT]
+The following code snippets are relevant to the user's request. Each chunk is prefixed with the file path it originated from. Use this information judiciously to answer the query.
+{context_str or "No relevant code context was retrieved from the codebase."}
+[END CONTEXT]
+---
+[CONVERSATION HISTORY]
+{history_str or "No previous conversation history."}
+---
+[USER QUESTION]
+{query}
+"""
+    return prompt
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = RAGCoderWindow()
+    window.show()
+    sys.exit(app.exec())
+
+--- END FILE: main_gui.py ---
+
+--- START FILE: models.py ---
+
+# models.py
+
+MODEL_OPTIONS = {
+    "Gemini 2.5 Flash (Advanced)": "gemini-2.5-flash",
+    "Gemini 2.5 Flash (Basic)": "gemini-2.5-flash-preview-09-2025",
+    "Gemini 2.5 Flash (Lite)": "gemini-2.5-flash-lite-preview-09-2025",
+}
+
+DEFAULT_MODEL = "gemini-2.5-flash-preview-09-2025"
+
+--- END FILE: models.py ---
+
+--- START FILE: requirements.txt ---
+
+google-generativeai
+faiss-cpu
+sentence-transformers
+numpy
+tqdm
+PySide6          # NEW REQUIREMENT for GUI
+markdown-it-py   # Helper for rendering markdown in Qt
+google-genai
+
+--- END FILE: requirements.txt ---
+
+--- START FILE: themes.py ---
+
+# themes.py
+# Define colors for easy injection into the ChatBubble HTML/CSS
+# The main QSS controls the application window, menu, and input area.
+# The 'html_user_bg' and 'html_asst_bg' are injected into the QTextBrowser's internal HTML style block.
+
+THEMES = {
+    "Dracula": {
+        "description": "Inspired by the popular Dracula theme, modern and dark.",
+        "html_user_bg": "#6272a4",  # Purple
+        "html_asst_bg": "#44475a",  # Darker Grey
+        "html_code_color": "#50fa7b", # Green
+        "QSS": """
+            /* General App Styling */
+            QMainWindow, QWidget#chat_area_widget { background-color: #282a36; color: #f8f8f2; }
+            QMenuBar, QWidget#sidebar_container, QWidget#chat_input_container { background-color: #1a1b26; border-color: #44475a; }
+            
+            /* Input & Dropdowns */
+            QLineEdit, QComboBox, QListWidget, QStatusBar {
+                background-color: #44475a; border: 1px solid #6272a4; color: #f8f8f2; padding: 5px; border-radius: 4px;
+            }
+            
+            /* Chat View Area */
+            QScrollArea, ChatViewWidget { background-color: #282a36; border: none; }
+            
+            /* Buttons */
+            QPushButton#new_chat_btn, QPushButton#send_button { background-color: #50fa7b; color: #1a1b26; font-weight: bold; }
+            QPushButton#delete_all_chats_btn { background-color: #ff5555; color: #1a1b26; }
+            QPushButton { background-color: #6272a4; color: #f8f8f2; padding: 8px 15px; border-radius: 4px; border: none; }
+            QPushButton:hover { background-color: #7a8aae; }
+            
+            /* Sidebar Specifics */
+            QWidget#sidebar_container { min-width: 280px; max-width: 280px; border-right: 1px solid #44475a; }
+            QListWidget#chat_list_widget { background-color: #1a1b26; }
+            QListWidget#chat_list_widget::item:selected { background-color: #44475a; border-left: 3px solid #50fa7b; }
+        """
+    },
+    
+    "Monokai": {
+        "description": "Classic developer Monokai scheme.",
+        "html_user_bg": "#f92672", # Pink
+        "html_asst_bg": "#494a41", # Darker Grey
+        "html_code_color": "#a6e22e", # Green
+        "QSS": """
+            QMainWindow, QWidget#chat_area_widget { background-color: #272822; color: #f8f8f2; }
+            QMenuBar, QWidget#sidebar_container, QWidget#chat_input_container { background-color: #383a31; border-color: #494a41; }
+            
+            QLineEdit, QComboBox, QListWidget, QStatusBar {
+                background-color: #494a41; border: 1px solid #5d5e56; color: #f8f8f2; padding: 5px; border-radius: 4px;
+            }
+            
+            QScrollArea, ChatViewWidget { background-color: #272822; border: none; }
+            
+            QPushButton#new_chat_btn, QPushButton#send_button { background-color: #a6e22e; color: #272822; font-weight: bold; }
+            QPushButton#delete_all_chats_btn { background-color: #ff007f; color: #272822; }
+            QPushButton { background-color: #66d9ef; color: #272822; padding: 8px 15px; border-radius: 4px; border: none; }
+            QPushButton:hover { background-color: #79e9ff; }
+            
+            QWidget#sidebar_container { min-width: 280px; max-width: 280px; border-right: 1px solid #494a41; }
+            QListWidget#chat_list_widget { background-color: #383a31; }
+            QListWidget#chat_list_widget::item:selected { background-color: #494a41; border-left: 3px solid #fd971f; }
+        """
+    },
+    
+    "One Dark": {
+        "description": "Popular VS Code/Atom One Dark scheme.",
+        "html_user_bg": "#61afef", # Blue
+        "html_asst_bg": "#3e4451", # Dark Gray
+        "html_code_color": "#98c379", # Light Green
+        "QSS": """
+            QMainWindow, QWidget#chat_area_widget { background-color: #282c34; color: #abb2bf; }
+            QMenuBar, QWidget#sidebar_container, QWidget#chat_input_container { background-color: #21252b; border-color: #3e4451; }
+            
+            QLineEdit, QComboBox, QListWidget, QStatusBar {
+                background-color: #3e4451; border: 1px solid #545b68; color: #abb2bf; padding: 5px; border-radius: 4px;
+            }
+            
+            QScrollArea, ChatViewWidget { background-color: #282c34; border: none; }
+            
+            QPushButton#new_chat_btn, QPushButton#send_button { background-color: #e5c07b; color: #21252b; font-weight: bold; }
+            QPushButton#delete_all_chats_btn { background-color: #e06c75; color: #21252b; }
+            QPushButton { background-color: #61afef; color: #21252b; padding: 8px 15px; border-radius: 4px; border: none; }
+            QPushButton:hover { background-color: #569cd6; }
+            
+            QWidget#sidebar_container { min-width: 280px; max-width: 280px; border-right: 1px solid #3e4451; }
+            QListWidget#chat_list_widget { background-color: #21252b; }
+            QListWidget#chat_list_widget::item:selected { background-color: #3e4451; border-left: 3px solid #c678dd; }
+        """
+    },
+    
+    "Matrix": {
+        "description": "The green code aesthetic.",
+        "html_user_bg": "#009900", # Lighter Green
+        "html_asst_bg": "#111111", # Very Dark Grey
+        "html_code_color": "#00ff00", # Neon Green
+        "QSS": """
+            QMainWindow, QWidget#chat_area_widget { background-color: #000000; color: #00ff00; }
+            QMenuBar, QWidget#sidebar_container, QWidget#chat_input_container { background-color: #001100; border-color: #006600; }
+            
+            QLineEdit, QComboBox, QListWidget, QStatusBar {
+                background-color: #003300; border: 1px solid #009900; color: #00ff00; padding: 5px; border-radius: 4px;
+            }
+            
+            QScrollArea, ChatViewWidget { background-color: #000000; border: none; }
+            
+            QPushButton#new_chat_btn, QPushButton#send_button { background-color: #00ff00; color: #000000; font-weight: bold; }
+            QPushButton#delete_all_chats_btn { background-color: #ff0000; color: #000000; }
+            QPushButton { background-color: #006600; color: #00ff00; padding: 8px 15px; border-radius: 4px; border: none; }
+            QPushButton:hover { background-color: #009900; }
+            
+            QWidget#sidebar_container { min-width: 280px; max-width: 280px; border-right: 1px solid #006600; }
+            QListWidget#chat_list_widget { background-color: #001100; }
+            QListWidget#chat_list_widget::item:selected { background-color: #003300; border-left: 3px solid #00ff00; }
+        """
+    },
+    
+    "ChatGPT Minimal": {
+        "description": "Extreme light/dark contrast theme.",
+        "html_user_bg": "#a7a7a7", # Light Grey
+        "html_asst_bg": "#343541", # Dark GPT Gray
+        "html_code_color": "#e06c75", # Red/Pink accent for code
+        "QSS": """
+            QMainWindow, QWidget#chat_area_widget { background-color: #ffffff; color: #343541; }
+            QMenuBar, QWidget#sidebar_container, QWidget#chat_input_container { background-color: #f7f7f8; border-color: #e5e5e5; color: #343541; }
+            
+            /* We reverse the color scheme for inputs to maintain contrast */
+            QLineEdit, QComboBox, QListWidget, QStatusBar {
+                background-color: #ffffff; border: 1px solid #e5e5e5; color: #343541; padding: 5px; border-radius: 4px;
+            }
+            
+            QScrollArea, ChatViewWidget { background-color: #ffffff; border: none; }
+            
+            QPushButton#new_chat_btn, QPushButton#send_button { background-color: #10a37f; color: #ffffff; font-weight: bold; }
+            QPushButton#delete_all_chats_btn { background-color: #cc0000; color: #ffffff; }
+            QPushButton { background-color: #d1d5db; color: #000000; padding: 8px 15px; border-radius: 4px; border: none; }
+            QPushButton:hover { background-color: #b3b7bb; }
+            
+            QWidget#sidebar_container { min-width: 280px; max-width: 280px; border-right: 1px solid #e5e5e5; }
+            QListWidget#chat_list_widget { background-color: #f7f7f8; }
+            QListWidget#chat_list_widget::item:selected { background-color: #e5e5e5; border-left: 3px solid #10a37f; }
+        """
+    }
+}
+
+DEFAULT_THEME = "Dracula"
+
+--- END FILE: themes.py ---
+
+--- START FILE: data\chat_metadata.json ---
+
+{
+    "fd801c44-9473-4b69-9cb7-12533e392eb3": "Default Chat"
+}
+
+--- END FILE: data\chat_metadata.json ---
+
+--- START FILE: data\config.json ---
+
+{
+    "api_keys": [
+        "AIzaSyCVnC-RyL84U0tvtMmowFzY5NNRIq7n--k"
+    ],
+    "current_model": "gemini-2.5-flash-preview-09-2025",
+    "active_chat_id": "fd801c44-9473-4b69-9cb7-12533e392eb3",
+    "current_theme": "Monokai"
+}
+
+--- END FILE: data\config.json ---
+
+--- START FILE: data\memory.json ---
+
+[
+    {
+        "role": "user",
+        "content": "hi"
+    },
+    {
+        "role": "user",
+        "content": "what to fix here?"
+    },
+    {
+        "role": "user",
+        "content": "what to fix here?"
+    },
+    {
+        "role": "user",
+        "content": "hi"
+    },
+    {
+        "role": "user",
+        "content": "hi"
+    },
+    {
+        "role": "assistant",
+        "content": "Hello! I'm ready to assist with your code.\n\nI see snippets related to a chat GUI component (`gui\\chat_widget.py`) and the main RAG processing logic (`main(old app).py`).\n\nHow can I help you today? Do you need to fix a bug, refactor some code, or understand a concept related to this application?"
+    }
+]
+
+--- END FILE: data\memory.json ---
+
+--- START FILE: data\chats\fd801c44-9473-4b69-9cb7-12533e392eb3.json ---
+
+[
+    {
+        "role": "user",
+        "content": "write a simple python code"
+    },
+    {
+        "role": "assistant",
+        "content": "Here is a simple Python code example that defines a basic function to calculate the square of a number.\n\n```python\n# Function definition\ndef square(number):\n  \"\"\"Calculates the square of the input number.\"\"\"\n  return number * number\n\n# Main execution\nif __name__ == \"__main__\":\n  x = 5\n  result = square(x)\n  \n  print(f\"The number is: {x}\")\n  print(f\"The square is: {result}\") \n\n# Output:\n# The number is: 5\n# The square is: 25\n```"
+    }
+]
+
+--- END FILE: data\chats\fd801c44-9473-4b69-9cb7-12533e392eb3.json ---
+
+--- START FILE: gui\chat_widget.py ---
+
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QTextBrowser, QSizePolicy, QApplication
+from PySide6.QtCore import Qt
+from markdown_it import MarkdownIt
+from config_manager import config_manager
+from themes import THEMES
+
+# Initialize markdown renderer to convert MD to HTML
+md = MarkdownIt().enable(['fence', 'code', 'list'])
+
+class ChatBubble(QWidget):
+    def __init__(self, role, content):
+        super().__init__()
+        # Get active theme details for dynamic coloring
+        theme_name = config_manager.get_current_theme()
+        theme_data = THEMES.get(theme_name, THEMES[list(THEMES.keys())[0]]) # Fallback
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setStyleSheet("background-color: transparent;")
+        
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(True)
+        browser.setReadOnly(True)
+        browser.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard) # Ensure copyable
+        
+        # --- Dynamic Styling based on Role and Theme ---
+        
+        if role == "user":
+            bg_color = theme_data["html_user_bg"]
+            text_color = "#000000" if theme_name == "ChatGPT Minimal" else "#f8f8f2"
+            alignment = Qt.AlignRight
+            # Use max-width to stop bubbles from filling the entire screen
+            # margin: top right bottom left;
+            bubble_style = f"padding: 10px; border-radius: 10px; background-color: {bg_color}; color: {text_color}; margin: 5px 0 5px auto; max-width: 75%;"
+        else: # assistant
+            bg_color = theme_data["html_asst_bg"]
+            text_color = "#343541" if theme_name == "ChatGPT Minimal" else "#f8f8f2"
+            alignment = Qt.AlignLeft
+            bubble_style = f"padding: 10px; border-radius: 10px; background-color: {bg_color}; color: {text_color}; margin: 5px auto 5px 0; max-width: 85%;" # Assistant allowed slightly more width
+
+        html_content = md.render(content)
+        code_color = theme_data["html_code_color"]
+        
+        # Inject styling into the HTML head
+        formatted_html = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial; font-size: 10pt; background-color: transparent; margin: 0; padding: 0; }}
+                /* Code block styling - MUST be inside the QTextBrowser HTML */
+                pre {{ 
+                    background-color: #1c1c1c; /* Use deep dark color for code background for contrast */
+                    color: {code_color}; 
+                    padding: 10px; 
+                    border-radius: 5px; 
+                    overflow-x: auto; 
+                    margin-top: 10px; 
+                    border: 1px solid {code_color}; 
+                }}
+                code {{ font-family: monospace; white-space: pre-wrap; }}
+                div.bubble {{ 
+                    {bubble_style} 
+                    float: {role}; 
+                    display: table; /* Ensures text flow respects max-width better */
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="bubble">
+                {html_content}
+            </div>
+        </body>
+        </html>
+        """
+        browser.setHtml(formatted_html)
+        
+        # Fix: Use QSizePolicy to ensure browser expands horizontally within its aligned space
+        browser.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        
+        # Adjust height based on content
+        doc = browser.document()
+        # Set text width before calculating height (adjust for padding and margin)
+        # We estimate the viewable width based on the parent alignment layout.
+        viewport_width = self.parentWidget().width() if self.parentWidget() else 800 
+        doc.setTextWidth(viewport_width * 0.7) 
+        
+        # Recalculate height after setting width
+        ideal_height = doc.size().height()
+        browser.setFixedHeight(int(ideal_height) + 30) # Add padding buffer
+
+        layout.addWidget(browser, alignment=alignment)
+
+class ChatViewWidget(QWidget):
+    # ... (clear_messages, add_message, refresh_view methods remain the same)
+    # The refresh_view method ensures that when the theme is switched, 
+    # ChatBubble is reconstructed using the latest theme settings from config_manager.
+    # We only need to ensure refresh_view is called when the theme changes.
+    
+    def __init__(self):
+        super().__init__()
+        # Ensure ChatViewWidget is named for QSS targeting
+        self.setObjectName("ChatViewWidget") 
+        self.layout = QVBoxLayout(self)
+        self.layout.setSpacing(10)
+        self.layout.setAlignment(Qt.AlignTop)
+        self.layout.setContentsMargins(10, 10, 10, 10)
+        
+    def clear_messages(self):
+        """Removes all child widgets (messages) from the layout."""
+        while self.layout.count():
+            item = self.layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def add_message(self, role, content):
+        bubble = ChatBubble(role, content)
+        self.layout.addWidget(bubble)
+        
+    def refresh_view(self, history: list[dict]): 
+        """Clears and re-renders the chat history."""
+        self.clear_messages()
+        for msg in history:
+            self.add_message(msg['role'], msg['content'])
+
+--- END FILE: gui\chat_widget.py ---
+
+--- START FILE: gui\setup_dialog.py ---
+
+import os
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, 
+    QListWidget, QListWidgetItem, QComboBox, QLabel, QMessageBox, 
+    QWidget
+)
+from PySide6.QtCore import Qt, Signal
+
+from config_manager import config_manager
+from models import MODEL_OPTIONS
+
+class SetupDialog(QDialog):
+    """
+    A modal dialog for managing Gemini API keys and selecting the active model.
+    """
+    # Signal emitted when settings are saved, prompting the main app to re-initialize RAG
+    config_updated = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage API Keys and Model")
+        self.setMinimumSize(500, 450)
+        
+        # Load current state from persistent manager
+        self.keys = config_manager.get_keys()[:] # Use a copy for manipulation
+        self.active_model = config_manager.get_current_model()
+        
+        self._setup_ui()
+        self._load_keys_list()
+
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        
+        # --- API Key Management Section ---
+        key_group = QWidget()
+        key_layout = QVBoxLayout(key_group)
+        key_layout.addWidget(QLabel("<b>Stored API Keys:</b>"))
+        
+        self.key_list = QListWidget()
+        key_layout.addWidget(self.key_list)
+        
+        # Key Input and Buttons
+        input_widget = QWidget()
+        input_layout = QHBoxLayout(input_widget)
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("Enter new Gemini API Key (AIza...)")
+        self.add_button = QPushButton("Add Key")
+        self.remove_button = QPushButton("Remove Selected")
+        
+        input_layout.addWidget(self.key_input)
+        input_layout.addWidget(self.add_button)
+        input_layout.addWidget(self.remove_button)
+        
+        key_layout.addWidget(input_widget)
+        main_layout.addWidget(key_group)
+
+        # --- Model Selection Section ---
+        model_group = QWidget()
+        model_layout = QHBoxLayout(model_group)
+        model_layout.addWidget(QLabel("<b>Active LLM Model:</b>"))
+        self.model_combo = QComboBox()
+        
+        # Populate model dropdown
+        for name, value in MODEL_OPTIONS.items():
+            self.model_combo.addItem(name, value)
+            if value == self.active_model:
+                self.model_combo.setCurrentText(name)
+        
+        model_layout.addWidget(self.model_combo)
+        model_group.setLayout(model_layout)
+        main_layout.addWidget(model_group)
+
+        # --- Footer ---
+        footer_layout = QHBoxLayout()
+        self.save_button = QPushButton("Save Settings")
+        self.save_button.setStyleSheet("background-color: #50fa7b; color: #21252b;") # Green save button
+        self.cancel_button = QPushButton("Cancel")
+        footer_layout.addWidget(self.cancel_button)
+        footer_layout.addWidget(self.save_button)
+        main_layout.addLayout(footer_layout)
+
+        # --- Connections ---
+        self.add_button.clicked.connect(self._add_key)
+        self.remove_button.clicked.connect(self._remove_key)
+        self.save_button.clicked.connect(self._save_settings)
+        self.cancel_button.clicked.connect(self.reject)
+
+    def _load_keys_list(self):
+        self.key_list.clear()
+        for key in self.keys:
+            display_key = f"{key[:4]}...{key[-4:]}"
+            item = QListWidgetItem(display_key)
+            item.setData(Qt.UserRole, key) 
+            self.key_list.addItem(item)
+            
+    def _add_key(self):
+        new_key = self.key_input.text().strip()
+        # Basic validation (Gemini keys usually start with 'AIza')
+        if not new_key or not new_key.startswith("AIza"):
+            QMessageBox.warning(self, "Invalid Key", "Please enter a valid-looking Gemini API key.")
+            return
+
+        if new_key not in self.keys:
+            self.keys.append(new_key)
+            self._load_keys_list()
+            self.key_input.clear()
+        else:
+            QMessageBox.information(self, "Duplicate", "This key is already stored.")
+
+    def _remove_key(self):
+        selected_items = self.key_list.selectedItems()
+        if not selected_items:
+            return
+        
+        reply = QMessageBox.question(self, 'Confirm Removal', 
+                                    "Are you sure you want to remove the selected API key?", 
+                                    QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            full_key_to_remove = selected_items[0].data(Qt.UserRole)
+            self.keys.remove(full_key_to_remove)
+            self._load_keys_list()
+
+    def _save_settings(self):
+        # Update model selection
+        model_name = self.model_combo.currentData(Qt.UserRole)
+
+        if not self.keys:
+            QMessageBox.critical(self, "Error", "You must have at least one API key saved.")
+            return
+
+        # 1. Persist keys (clear and rewrite)
+        config_manager.config["api_keys"] = self.keys
+        # 2. Persist model
+        config_manager.set_current_model(model_name)
+        
+        QMessageBox.information(self, "Success", "Settings saved successfully. The RAG system will now restart.")
+        self.config_updated.emit() 
+        self.accept()
+
+--- END FILE: gui\setup_dialog.py ---
+
+--- START FILE: indexing\code_indexer.py ---
+
+import os
+from tqdm import tqdm
+from utils.chunking import chunk_text, embed
+from memory.vector_store import VectorStore
+from rich.console import Console
+
+console = Console()
+
+class CodeIndexer:
+    def __init__(self):
+        self.store = VectorStore()
+        # Common code file extensions to index
+        self.extensions = (".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".cs", ".go", ".html", ".css", ".md")
+
+    def index_directory(self, path):
+        if not os.path.isdir(path):
+            console.print(f"[bold red]Error:[/bold red] Path '{path}' is not a valid directory.")
+            return
+
+        console.print(f"\n[bold blue]Starting indexing of:[/bold blue] {path}")
+        all_chunks = []
+        all_files = []
+
+        # First pass: Gather all relevant files
+        for root, _, files in os.walk(path):
+            for file in files:
+                if file.endswith(self.extensions) and "venv" not in root and ".git" not in root:
+                    all_files.append(os.path.join(root, file))
+        
+        if not all_files:
+            console.print("[bold red]No code files found[/bold red] or they were filtered out.")
+            return
+
+        # Second pass: Process and chunk files with progress bar
+        for file_path in tqdm(all_files, desc="Chunking and Indexing"):
+            try:
+                with open(file_path, "r", encoding="utf-8", errors='ignore') as f:
+                    content = f.read()
+                    
+                    # We pass the relative filename to be included in the chunk context
+                    relative_path = os.path.relpath(file_path, path)
+                    chunks = chunk_text(content, relative_path)
+                    all_chunks.extend(chunks)
+            except Exception as e:
+                console.print(f"[bold yellow]Skipping file[/bold yellow] {file_path} due to error: {e}")
+
+        if all_chunks:
+            # Batch embedding and adding to FAISS
+            embeddings = embed(all_chunks)
+            self.store.add(embeddings, all_chunks)
+            console.print(f"\n[bold green]Indexing Complete![/bold green] Total chunks added: {len(all_chunks)}")
+        else:
+            console.print("[bold yellow]No chunks were generated.[/bold yellow]")
+
+--- END FILE: indexing\code_indexer.py ---
+
+--- START FILE: llm\gemini_client.py ---
+
+import google.genai as genai
+# Import the shared config manager instance
+from config_manager import config_manager 
+import itertools
+import time
+
+class GeminiClient:
+    def __init__(self):
+        self._client = None  # NEW: Hold the client instance
+        self._load_config()
+        self._configure()
+
+    def _load_config(self):
+        self.api_keys = config_manager.get_keys()
+        self.model_name = config_manager.get_current_model()
+        
+        if not self.api_keys:
+            # We won't raise an error here; the main app will handle the setup prompt
+            self.current_key = None
+            self.keys_cycle = None
+        else:
+            self.keys_cycle = itertools.cycle(self.api_keys)
+            self.current_key = next(self.keys_cycle)
+
+    def _configure(self):
+        """Initializes the Gemini client instance with the current key and model."""
+        if self.current_key:
+            # FIX: Create a Client instance using the API key
+            self._client = genai.Client(api_key=self.current_key)
+            # We skip retrieving the model object, as generate_content uses the model name string.
+            self.model = True
+        else:
+            self._client = None
+            self.model = None
+
+    def switch_model(self, model_name):
+        """Switches the active model and updates configuration."""
+        self.model_name = model_name
+        config_manager.set_current_model(model_name)
+        self._configure()
+        
+    def switch_key(self):
+        """Cycles to the next available API key."""
+        if self.keys_cycle and len(self.api_keys) > 1:
+            self.current_key = next(self.keys_cycle)
+            self._configure()
+            # In a TUI, we emit a signal instead of printing to console
+            return True
+        return False
+
+    def generate(self, prompt, max_retries=3):
+        if not self._client:
+             return "ERROR: Gemini model not initialized. Please configure API keys."
+
+        last_error = None # Track the last specific error
+        
+        for attempt in range(max_retries):
+            try:
+                # FIX: Use the client instance's generate_content method
+                response = self._client.models.generate_content(
+                    model=self.model_name, # Specify model name explicitly
+                    contents=prompt
+                )
+                return response.text
+            except Exception as e:
+                last_error = e # Capture the error
+                error_msg = str(e).lower()
+                
+                if "quota" in error_msg or "rate limit" in error_msg:
+                    if self.switch_key():
+                        print(f"DEBUG: Key switch successful. Retrying...")
+                        continue
+                    else:
+                        break # Exit loop if no more keys
+
+                # If it's another non-quota error, still try to cycle if keys are available
+                if self.keys_cycle and len(self.api_keys) > 1 and attempt < max_retries - 1:
+                    print(f"DEBUG: Non-quota error ({e}). Cycling key.")
+                    self.switch_key()
+                    continue
+                
+                # Exponential backoff for non-quota/non-switchable errors
+                time.sleep(2 ** attempt) 
+        
+        # If we exit the loop due to failed retries, raise the last specific error found
+        if last_error:
+            # We wrap the specific error to maintain the general structure for the GUI
+            raise Exception(f"Failed after retries. Last specific error: {last_error}")
+        
+        # Should only be reached if retries exhausted without a clear error capture (unlikely now)
+        raise Exception("Failed to generate content after multiple retries.")
+
+--- END FILE: llm\gemini_client.py ---
+
+--- START FILE: memory\chat_memory.py ---
+
+import json
+import os
+import uuid
+from config_manager import config_manager # Import config to save active chat ID
+
+MEMORY_DIR = "data/chats"
+CHAT_META_FILE = os.path.join("data", "chat_metadata.json") # Ensure this constant is available
+
+class ChatMemory:
+    def __init__(self):
+        os.makedirs(MEMORY_DIR, exist_ok=True)
+        self.metadata = self._load_metadata()
+        self.active_chat_id = config_manager.get_active_chat_id()
+        
+        if not self.active_chat_id or self.active_chat_id not in self.metadata:
+            # If no active chat or saved ID is invalid, create a new one
+            self.new_chat("Default Chat")
+
+    def _load_metadata(self) -> dict:
+        """Loads metadata mapping ID to name."""
+        if os.path.exists(CHAT_META_FILE):
+            try:
+                with open(CHAT_META_FILE, 'r') as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                return {}
+        return {}
+        
+    def _save_metadata(self):
+        """Saves chat ID to name mapping."""
+        with open(CHAT_META_FILE, 'w') as f:
+            json.dump(self.metadata, f, indent=4)
+
+    def new_chat(self, name: str = "New Chat"):
+        """Creates a new empty chat session and sets it as active."""
+        chat_id = str(uuid.uuid4())
+        self.metadata[chat_id] = name
+        self.active_chat_id = chat_id
+        config_manager.set_active_chat_id(chat_id)
+        self._save_metadata()
+        
+        # Create an empty file for the new chat
+        with open(os.path.join(MEMORY_DIR, f"{chat_id}.json"), "w") as f:
+            json.dump([], f)
+            
+        return chat_id
+
+    def switch_chat(self, chat_id: str):
+        """Sets an existing chat as active."""
+        if chat_id in self.metadata:
+            self.active_chat_id = chat_id
+            config_manager.set_active_chat_id(chat_id)
+        else:
+            raise ValueError(f"Chat ID {chat_id} not found.")
+
+    def delete_chat(self, chat_id: str):
+        """Deletes a chat file and its metadata."""
+        if chat_id in self.metadata:
+            del self.metadata[chat_id]
+            self._save_metadata()
+            
+            chat_file = os.path.join(MEMORY_DIR, f"{chat_id}.json")
+            if os.path.exists(chat_file):
+                os.remove(chat_file)
+            
+            # If deleted chat was active, create a new default chat
+            if self.active_chat_id == chat_id:
+                self.new_chat("New Default Chat")
+
+    def get_all_chats(self) -> dict:
+        """Returns {chat_id: chat_name} mapping."""
+        return self.metadata
+
+    def save(self, role: str, content: str):
+        """Saves a message to the currently active chat history."""
+        if not self.active_chat_id:
+            return # Should not happen after initialization
+
+        chat_file = os.path.join(MEMORY_DIR, f"{self.active_chat_id}.json")
+        data = self.load()
+        data.append({"role": role, "content": content})
+        
+        # Keep only the last 20 messages for context window management
+        with open(chat_file, "w") as f:
+            json.dump(data[-20:], f, indent=4)
+
+    def load(self) -> list[dict]:
+        """Loads the current active chat history."""
+        if not self.active_chat_id:
+            return []
+            
+        chat_file = os.path.join(MEMORY_DIR, f"{self.active_chat_id}.json")
+        try:
+            with open(chat_file, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Recreate an empty file if corrupted or missing
+            with open(chat_file, "w") as f:
+                json.dump([], f)
+            return []
+
+    def clear_active_chat(self):
+        """Clears all messages from the current active chat."""
+        if self.active_chat_id:
+            chat_file = os.path.join(MEMORY_DIR, f"{self.active_chat_id}.json")
+            with open(chat_file, "w") as f:
+                json.dump([], f)
+
+--- END FILE: memory\chat_memory.py ---
+
+--- START FILE: memory\vector_store.py ---
+
+import faiss
+import numpy as np
+import os
+import pickle
+from rich.console import Console
+
+console = Console()
+
+class VectorStore:
+    def __init__(self, dim=384, store_path="data"):
+        self.dim = dim
+        self.store_path = store_path
+        self.index_file = os.path.join(store_path, "faiss.index")
+        self.meta_file = os.path.join(store_path, "meta.pkl")
+        
+        self.texts = []
+        self.index = faiss.IndexFlatL2(dim)
+        self._load()
+
+    def add(self, embeddings: np.ndarray, texts: list[str]):
+        """Adds new embeddings and text chunks to the store."""
+        self.index.add(embeddings)
+        self.texts.extend(texts)
+        self._save()
+        console.print(f"[bold magenta]Vector Store updated:[/bold magenta] Total vectors: {len(self.texts)}")
+
+    def search(self, embedding: np.ndarray, top_k: int) -> list[str]:
+        """Searches the store for the top_k most relevant chunks."""
+        if not self.texts:
+            return []
+            
+        # Ensure embedding is 2D array for FAISS search
+        embedding = embedding.reshape(1, -1)
+        
+        D, I = self.index.search(embedding, top_k)
+        
+        # I contains the indices of the nearest neighbors
+        return [self.texts[i] for i in I[0] if i < len(self.texts)]
+
+    def _save(self):
+        """Persists the FAISS index and text metadata to local files."""
+        os.makedirs(self.store_path, exist_ok=True)
+        faiss.write_index(self.index, self.index_file)
+        with open(self.meta_file, "wb") as f:
+            pickle.dump(self.texts, f)
+        
+    def _load(self):
+        """Loads the index and metadata if they exist."""
+        if os.path.exists(self.index_file) and os.path.exists(self.meta_file):
+            self.index = faiss.read_index(self.index_file)
+            with open(self.meta_file, "rb") as f:
+                self.texts = pickle.load(f)
+            console.print(f"[bold green]Loaded FAISS Index[/bold green] with {len(self.texts)} chunks.")
+        else:
+            console.print("[bold yellow]No existing index found.[/bold yellow] Starting fresh.")
+
+--- END FILE: memory\vector_store.py ---
+
+--- START FILE: retrieval\retriever.py ---
+
+from utils.chunking import embed
+from memory.vector_store import VectorStore
+from config import TOP_K
+
+class Retriever:
+    def __init__(self):
+        self.store = VectorStore()
+
+    def retrieve(self, query: str) -> list[str]:
+        """Performs vector search based on the user query."""
+        if not self.store.texts:
+            return []
+            
+        q_emb = embed([query])[0]
+        return self.store.search(q_emb, TOP_K)
+
+--- END FILE: retrieval\retriever.py ---
+
+--- START FILE: utils\chunking.py ---
+
+from sentence_transformers import SentenceTransformer
+from config import CHUNK_SIZE, CHUNK_OVERLAP, EMBED_MODEL
+import numpy as np
+
+# Load the embedding model globally once
+model = SentenceTransformer(EMBED_MODEL)
+
+def chunk_text(text: str, filename: str) -> list[str]:
+    """Splits a large text block (code file) into contextual chunks."""
+    
+    # Simple recursive splitting based on token count
+    # Note: For production code, ideally use language-aware (e.g., AST) splitting.
+    
+    chunks = []
+    start = 0
+    context_prefix = f"[FILE: {filename}] "
+    
+    while start < len(text):
+        end = start + CHUNK_SIZE
+        
+        # Append the chunk, prepended with file context
+        chunk_content = text[start:end]
+        chunks.append(context_prefix + chunk_content)
+        
+        start += CHUNK_SIZE - CHUNK_OVERLAP
+        
+    return chunks
+
+def embed(texts: list[str]) -> np.ndarray:
+    """Generates embeddings for a list of texts."""
+    return model.encode(texts, convert_to_numpy=True)
+
+--- END FILE: utils\chunking.py ---

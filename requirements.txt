@@ -1,0 +1,9 @@
+google-generativeai
+faiss-cpu
+sentence-transformers
+numpy
+tqdm
+PySide6          # NEW REQUIREMENT for GUI
+markdown-it-py   # Helper for rendering markdown in Qt
+google-genai
+pyinstaller        # For packaging the application

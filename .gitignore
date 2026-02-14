@@ -1,0 +1,72 @@
+# ==================================
+# Build & Environment Artifacts
+# ==================================
+
+# Python Virtual Environment
+venv/
+.venv/
+env/
+.env/
+
+# PyInstaller / Build Artifacts
+# Hide the temporary PyInstaller build directory
+/build/
+
+# Hide the final executable distribution folder
+/dist/
+*.spec
+
+# Python byte-code (pyc files and folders)
+__pycache__/
+*.pyc
+*.pyd
+*.so
+
+# Python testing/coverage reports
+.pytest_cache/
+.coverage
+
+# ==================================
+# Data & State (DO NOT COMMIT)
+# ==================================
+
+# Application Data Folder (contains user configuration and chat history)
+# We ignore the entire 'data' folder to ensure user secrets (API keys) and local history are not committed.
+/data/
+
+# Specific files generated within /data/ that MUST NOT be tracked:
+# 1. API Keys and Settings
+/data/config.json
+/data/chat_metadata.json
+
+# 2. Vector Index Files (FAISS and metadata)
+# These are large, generated artifacts that change constantly.
+/data/faiss.index
+/data/meta.pkl
+
+# 3. Chat History
+# This folder contains individual chat JSON files
+/data/chats/
+
+# 4. Old Memory File (If still sitting in root data folder, often redundant)
+/data/memory.json 
+
+# ==================================
+# IDE / Editor Files
+# ==================================
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm / IntelliJ
+.idea/
+
+# Jupyter/Python Cache
+.ipynb_checkpoints
+
+# ==================================
+# Generic OS Files
+# ==================================
+.DS_Store
+Thumbs.db
