@@ -12,33 +12,54 @@ class CodeIndexer:
         # Common code file extensions to index
         self.extensions = (".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".cs", ".go", ".html", ".css", ".md")
 
-    def index_directory(self, path):
-        if not os.path.isdir(path):
-            console.print(f"[bold red]Error:[/bold red] Path '{path}' is not a valid directory.")
+    def index_paths(self, paths: list[str]):
+        """Indexes a list of paths, which can be directories or individual files."""
+        if not paths:
             return
 
-        console.print(f"\n[bold blue]Starting indexing of:[/bold blue] {path}")
+        console.print(f"\n[bold blue]Starting indexing process...[/bold blue] ({len(paths)} initial paths)")
         all_chunks = []
-        all_files = []
+        all_files_to_index = []
 
-        # First pass: Gather all relevant files
-        for root, _, files in os.walk(path):
-            for file in files:
-                if file.endswith(self.extensions) and "venv" not in root and ".git" not in root:
-                    all_files.append(os.path.join(root, file))
-        
-        if not all_files:
+        for path in paths:
+            path = os.path.abspath(path) # Ensure absolute path consistency
+            if os.path.isdir(path):
+                # Recursively walk directories
+                for root, _, files in os.walk(path):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        # Check ignore patterns and extension
+                        if file.endswith(self.extensions) and "venv" not in root and ".git" not in root:
+                            all_files_to_index.append(file_path)
+            elif os.path.isfile(path):
+                # Add individual files directly, provided they match extensions
+                if path.endswith(self.extensions):
+                    all_files_to_index.append(path)
+                else:
+                    console.print(f"[bold yellow]Skipping file[/bold yellow] {path}: unsupported extension.")
+            else:
+                console.print(f"[bold red]Error:[/bold red] Path '{path}' is not a valid directory or file.")
+
+        if not all_files_to_index:
             console.print("[bold red]No code files found[/bold red] or they were filtered out.")
             return
 
         # Second pass: Process and chunk files with progress bar
-        for file_path in tqdm(all_files, desc="Chunking and Indexing"):
+        # Determine the base path for relative path display
+        base_path = os.path.commonpath(all_files_to_index) if len(all_files_to_index) > 1 else ""
+
+        for file_path in tqdm(all_files_to_index, desc="Chunking and Indexing"):
             try:
                 with open(file_path, "r", encoding="utf-8", errors='ignore') as f:
                     content = f.read()
                     
-                    # We pass the relative filename to be included in the chunk context
-                    relative_path = os.path.relpath(file_path, path)
+                    # Use relative path if a common base exists, otherwise use the full path
+                    if base_path:
+                         # Ensure the path is relative to the common root for cleaner context output
+                         relative_path = os.path.relpath(file_path, base_path)
+                    else:
+                         relative_path = file_path # Single file/no common root
+
                     chunks = chunk_text(content, relative_path)
                     all_chunks.extend(chunks)
             except Exception as e:

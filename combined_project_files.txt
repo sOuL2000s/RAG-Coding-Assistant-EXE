@@ -1,4 +1,81 @@
 
+--- START FILE: .gitignore ---
+
+# ==================================
+# Build & Environment Artifacts
+# ==================================
+
+# Python Virtual Environment
+venv/
+.venv/
+env/
+.env/
+
+# PyInstaller / Build Artifacts
+# Hide the temporary PyInstaller build directory
+/build/
+
+# Hide the final executable distribution folder
+/dist/
+*.spec
+
+# Python byte-code (pyc files and folders)
+__pycache__/
+*.pyc
+*.pyd
+*.so
+
+# Python testing/coverage reports
+.pytest_cache/
+.coverage
+
+# ==================================
+# Data & State (DO NOT COMMIT)
+# ==================================
+
+# Application Data Folder (contains user configuration and chat history)
+# We ignore the entire 'data' folder to ensure user secrets (API keys) and local history are not committed.
+/data/
+
+# Specific files generated within /data/ that MUST NOT be tracked:
+# 1. API Keys and Settings
+/data/config.json
+/data/chat_metadata.json
+
+# 2. Vector Index Files (FAISS and metadata)
+# These are large, generated artifacts that change constantly.
+/data/faiss.index
+/data/meta.pkl
+
+# 3. Chat History
+# This folder contains individual chat JSON files
+/data/chats/
+
+# 4. Old Memory File (If still sitting in root data folder, often redundant)
+/data/memory.json 
+
+# ==================================
+# IDE / Editor Files
+# ==================================
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm / IntelliJ
+.idea/
+
+# Jupyter/Python Cache
+.ipynb_checkpoints
+
+# ==================================
+# Generic OS Files
+# ==================================
+.DS_Store
+Thumbs.db
+
+--- END FILE: .gitignore ---
+
 --- START FILE: config.py ---
 
 # Static RAG Hyperparameters
@@ -963,6 +1040,66 @@ DEFAULT_MODEL = "gemini-2.5-flash-preview-09-2025"
 
 --- END FILE: models.py ---
 
+--- START FILE: pyinstaller-guide.txt ---
+
+pyinstaller main_gui.py -F -w --name "RAG-Coder-Assistant" --collect-all PySide6 --collect-all sentence_transformers --hidden-import sentence_transformers --add-data "C:/Users/Souparna/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2;sentence_transformer_cache/all-MiniLM-L6-v2" --paths ".\gui" --paths ".\llm" --paths ".\memory" --paths ".\indexing" --paths ".\retrieval" --paths ".\utils"
+
+
+--- END FILE: pyinstaller-guide.txt ---
+
+--- START FILE: RAG-Coder-Assistant.spec ---
+
+# -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+datas = [('C:/Users/Souparna/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2', 'sentence_transformer_cache/all-MiniLM-L6-v2')]
+binaries = []
+hiddenimports = ['sentence_transformers']
+tmp_ret = collect_all('PySide6')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('sentence_transformers')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+
+a = Analysis(
+    ['main_gui.py'],
+    pathex=['.\\gui', '.\\llm', '.\\memory', '.\\indexing', '.\\retrieval', '.\\utils'],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='RAG-Coder-Assistant',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
+
+--- END FILE: RAG-Coder-Assistant.spec ---
+
 --- START FILE: requirements.txt ---
 
 google-generativeai
@@ -973,6 +1110,8 @@ tqdm
 PySide6          # NEW REQUIREMENT for GUI
 markdown-it-py   # Helper for rendering markdown in Qt
 google-genai
+pyinstaller        # For packaging the application
+
 
 --- END FILE: requirements.txt ---
 
@@ -1816,9 +1955,31 @@ class Retriever:
 from sentence_transformers import SentenceTransformer
 from config import CHUNK_SIZE, CHUNK_OVERLAP, EMBED_MODEL
 import numpy as np
+import sys
+import os
+from pathlib import Path # NEW IMPORT
 
 # Load the embedding model globally once
-model = SentenceTransformer(EMBED_MODEL)
+# --- MODIFIED FOR PYINSTALLER ---
+def get_model_path():
+    """Determines the correct model path based on PyInstaller environment."""
+    if getattr(sys, 'frozen', False):
+        # Running from PyInstaller bundle: Model is bundled under the relative path
+        base_path = Path(sys._MEIPASS)
+        # Target path defined in PyInstaller --add-data flag
+        return str(base_path / "sentence_transformer_cache" / EMBED_MODEL)
+    else:
+        # Running normally (model will be downloaded/cached conventionally)
+        return EMBED_MODEL
+
+try:
+    model = SentenceTransformer(get_model_path())
+except Exception as e:
+    print(f"Error loading embedding model: {e}")
+    # Fallback/Error state
+    model = None
+
+# --------------------------------
 
 def chunk_text(text: str, filename: str) -> list[str]:
     """Splits a large text block (code file) into contextual chunks."""
@@ -1843,6 +2004,8 @@ def chunk_text(text: str, filename: str) -> list[str]:
 
 def embed(texts: list[str]) -> np.ndarray:
     """Generates embeddings for a list of texts."""
+    if model is None:
+        raise RuntimeError("Embedding model failed to load.")
     return model.encode(texts, convert_to_numpy=True)
 
 --- END FILE: utils\chunking.py ---

@@ -21,6 +21,7 @@ from config_manager import config_manager
 from gui.chat_widget import ChatViewWidget
 from gui.setup_dialog import SetupDialog
 from themes import THEMES, DEFAULT_THEME # NEW IMPORT
+from models import DEFAULT_MODEL # Ensure DEFAULT_MODEL is imported
 
 # Ensure data directory exists
 os.makedirs("data", exist_ok=True)
@@ -61,14 +62,16 @@ class IndexWorker(QThread):
     finished = Signal(str)
     error = Signal(str)
 
-    def __init__(self, path, indexer):
+    def __init__(self, paths: list[str], indexer):
         super().__init__()
-        self.path = path
+        # paths is now a list of directories or files
+        self.paths = paths 
         self.indexer = indexer
 
     def run(self):
         try:
-            self.indexer.index_directory(self.path) 
+            # Call the updated indexer method
+            self.indexer.index_paths(self.paths) 
             self.finished.emit(f"Indexing successful! Total chunks: {len(self.indexer.store.texts)}")
         except Exception as e:
             self.error.emit(f"Indexing Failed: {e}")
@@ -208,10 +211,25 @@ class RAGCoderWindow(QMainWindow):
         settings_menu = QMenu("&Settings", self)
         key_action = settings_menu.addAction("Manage API Keys & Model")
         key_action.triggered.connect(self._show_setup_dialog)
+        
+        # NEW: Delete Settings & API Keys
+        clear_settings_action = settings_menu.addAction("Delete Settings & API Keys")
+        clear_settings_action.triggered.connect(self._clear_settings_data)
 
         data_menu = QMenu("&Data Management", self)
-        index_action = data_menu.addAction("Index New Codebase...")
-        index_action.triggered.connect(self._prompt_for_indexing)
+        
+        index_dir_action = data_menu.addAction("Index Codebase Directory...")
+        index_dir_action.triggered.connect(self._prompt_for_indexing_directory)
+        
+        # NEW: Index Specific Files
+        index_files_action = data_menu.addAction("Index Specific Code Files...")
+        index_files_action.triggered.connect(self._prompt_for_indexing_files)
+        
+        data_menu.addSeparator() 
+        
+        # NEW: Clear Index Data
+        clear_index_action = data_menu.addAction("Delete Codebase Index")
+        clear_index_action.triggered.connect(self._clear_index_data)
         
         clear_all_action = data_menu.addAction("💣 Clear ALL Application Data")
         clear_all_action.triggered.connect(self._clear_all_data)
@@ -321,8 +339,7 @@ class RAGCoderWindow(QMainWindow):
         
         if reply == QMessageBox.Yes:
             try:
-                # 1. Clear config state immediately: This prevents ChatMemory from trying to
-                # reuse a deleted active_chat_id later.
+                # 1. Clear config state immediately: 
                 config_manager.set_active_chat_id(None)
                 
                 # 2. Remove all chat files and the chat directory structure
@@ -333,11 +350,10 @@ class RAGCoderWindow(QMainWindow):
                 if os.path.exists(CHAT_META_FILE):
                     os.remove(CHAT_META_FILE)
                 
-                # 4. Re-initialize memory: this ensures the object starts from a clean disk state, 
-                # creating one new 'Default Chat'.
+                # 4. Re-initialize memory
                 self.memory = ChatMemory() 
                 
-                # 5. Explicitly clear the UI list widget and refresh based on the new memory object
+                # 5. Update UI
                 self.chat_list.clear() 
                 self.chat_view.clear_messages()
                 self._refresh_chat_list()
@@ -347,10 +363,55 @@ class RAGCoderWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to clear chat history: {e}")
 
-    # --- Data Clearing Management ---
+    # --- Data Clearing Management (New/Refined) ---
+    
+    def _clear_settings_data(self):
+        """Resets application settings (API keys, model, theme) but keeps chat history and index."""
+        reply = QMessageBox.critical(self, 'Confirm Reset', 
+                                    "Are you sure you want to delete all stored API keys, reset the active model, and reset the theme?", 
+                                    QMessageBox.Yes | QMessageBox.No)
+            
+        if reply == QMessageBox.Yes:
+            try:
+                # 1. Reset Configuration
+                config_manager.config["api_keys"] = []
+                config_manager.config["current_model"] = DEFAULT_MODEL
+                config_manager.config["current_theme"] = DEFAULT_THEME
+                config_manager._save()
+                
+                # 2. Re-initialize Gemini client
+                self.gemini = None 
+                
+                QMessageBox.information(self, "Success", "Settings (API keys, model, theme) have been reset. Please set a new API key to continue.")
+                self.status_update_signal.emit("Settings reset. RAG system disabled until new key is configured.")
+                self._show_setup_dialog()
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to clear settings: {e}")
+
+    def _clear_index_data(self):
+        """Deletes only the vector store files (faiss.index and meta.pkl)."""
+        reply = QMessageBox.question(self, 'Confirm Deletion', 
+                                    "Are you sure you want to permanently delete the indexed codebase data (FAISS index)? You will need to re-index your code to use RAG.", 
+                                    QMessageBox.Yes | QMessageBox.No)
+            
+        if reply == QMessageBox.Yes:
+            try:
+                # 1. Clear Vector Index Files
+                index_files = ["data/faiss.index", "data/meta.pkl"]
+                for f in index_files:
+                    if os.path.exists(f): os.remove(f)
+                
+                # 2. Re-initialize indexer and retriever immediately (resets internal state)
+                self.indexer = CodeIndexer() 
+                self.retriever = Retriever()
+                
+                self.status_update_signal.emit("Codebase index successfully deleted.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to clear index data: {e}")
     
     def _clear_all_data(self):
-        """Deletes all memory, index, and potentially configuration."""
+        """Deletes all memory, index, and configuration."""
         reply = QMessageBox.critical(self, 'DANGER: Clear All Data', 
             "WARNING: This will permanently delete ALL chat history, the vector index (code knowledge), and reset API key configurations. Are you absolutely sure?", 
             QMessageBox.Yes | QMessageBox.No)
@@ -361,20 +422,27 @@ class RAGCoderWindow(QMainWindow):
                 index_files = ["data/faiss.index", "data/meta.pkl"]
                 for f in index_files:
                     if os.path.exists(f): os.remove(f)
-                self.indexer = CodeIndexer() # Re-initialize empty index
-                self.retriever = Retriever()
                 
                 # 2. Clear Chat History Files
                 shutil.rmtree(MEMORY_DIR, ignore_errors=True)
                 os.makedirs(MEMORY_DIR)
-                self.memory = ChatMemory() # Re-initialize memory, creating new default chat
+                
+                # 3. Reset Configuration (clear keys, reset model/theme, reset active chat ID)
+                config_manager.config["api_keys"] = []
+                config_manager.config["current_model"] = DEFAULT_MODEL
+                config_manager.config["current_theme"] = DEFAULT_THEME
+                config_manager.config["active_chat_id"] = None 
+                config_manager._save()
+                
+                # 4. Re-initialize components
+                self.indexer = CodeIndexer()
+                self.retriever = Retriever()
+                self.memory = ChatMemory() # Creates a new 'Default Chat'
+                self.gemini = None
+                
+                # 5. Update UI
                 self._refresh_chat_list()
                 self.chat_view.clear_messages()
-                
-                # 3. Reset Configuration (keep theme/model, clear keys)
-                config_manager.config["api_keys"] = []
-                config_manager._save()
-                self.gemini = None
                 
                 QMessageBox.information(self, "Success", "All application data cleared. Please manage API keys to restart RAG functionality.")
                 self._show_setup_dialog()
@@ -425,7 +493,8 @@ class RAGCoderWindow(QMainWindow):
         if query.lower().startswith("!index"):
             try:
                 _, path = query.split(maxsplit=1)
-                self._start_index_worker(path.strip())
+                # Pass a list containing the single path for directory indexing
+                self._start_index_worker([path.strip()]) 
             except ValueError:
                 self.status_bar.showMessage("Invalid index command. Use: !index <path>")
             return
@@ -442,10 +511,21 @@ class RAGCoderWindow(QMainWindow):
         # 2. Start RAG worker
         self._start_rag_worker(query)
 
-    def _prompt_for_indexing(self):
+    def _prompt_for_indexing_directory(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Codebase Directory to Index")
         if dir_path:
-            self._start_index_worker(dir_path)
+            self._start_index_worker([dir_path]) # Pass as list
+
+    def _prompt_for_indexing_files(self):
+        """Allows selection of multiple files for indexing (new feature)."""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, 
+            "Select Code Files to Index", 
+            "", 
+            "Code Files (*.py *.js *.ts *.java *.cpp *.c *.h *.cs *.go *.html *.css *.md);;All Files (*)"
+        )
+        if file_paths:
+            self._start_index_worker(file_paths) # Pass the list of files
 
     def _start_rag_worker(self, query):
         self.rag_worker = RAGWorker(query, self.gemini, self.retriever, self.memory, build_rag_prompt)
@@ -461,11 +541,15 @@ class RAGCoderWindow(QMainWindow):
     def _rag_error(self, message):
         QMessageBox.critical(self, "Gemini Error", message)
 
-    def _start_index_worker(self, path):
-        self.index_worker = IndexWorker(path, self.indexer)
+    def _start_index_worker(self, paths: list[str]):
+        if not paths: return 
+        
+        self.index_worker = IndexWorker(paths, self.indexer) # Use the list of paths
         self.index_worker.finished.connect(self._index_finished)
         self.index_worker.error.connect(self._index_error)
-        self.status_update_signal.emit(f"Indexing started for: {path}")
+        
+        display_path = paths[0] if len(paths) == 1 else f"{len(paths)} items"
+        self.status_update_signal.emit(f"Indexing started for: {display_path}")
         self.index_worker.start()
 
     def _index_finished(self, message):
