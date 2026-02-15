@@ -518,11 +518,17 @@ class RAGCoderWindow(QMainWindow):
 
     def _prompt_for_indexing_files(self):
         """Allows selection of multiple files for indexing (new feature)."""
+        # --- MODIFIED FILTER ---
+        indexable_files_filter = (
+            "Indexable Files (*.py *.js *.ts *.java *.cpp *.c *.h *.cs *.go *.html *.css *.md "
+            "*.txt *.log *.csv *.json *.xml *.yaml *.yml *.ini *.toml *.gitignore *.spec LICENSE README Dockerfile);;"
+            "All Files (*)"
+        )
         file_paths, _ = QFileDialog.getOpenFileNames(
             self, 
-            "Select Code Files to Index", 
+            "Select Code and Text Files to Index", 
             "", 
-            "Code Files (*.py *.js *.ts *.java *.cpp *.c *.h *.cs *.go *.html *.css *.md);;All Files (*)"
+            indexable_files_filter
         )
         if file_paths:
             self._start_index_worker(file_paths) # Pass the list of files

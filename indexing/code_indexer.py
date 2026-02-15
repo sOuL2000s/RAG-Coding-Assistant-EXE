@@ -9,8 +9,19 @@ console = Console()
 class CodeIndexer:
     def __init__(self):
         self.store = VectorStore()
-        # Common code file extensions to index
-        self.extensions = (".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".cs", ".go", ".html", ".css", ".md")
+        # EXPANDED: Supported file extensions for indexing
+        self.supported_extensions = (
+            # Code/Markup
+            ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".cs", ".go", ".html", ".css", ".md",
+            ".rst", ".xml",
+            # Text/Config/Data
+            ".txt", ".log", ".csv", ".json", ".yaml", ".yml", ".ini", ".toml",
+            ".gitignore", # Important configuration files
+            ".spec", # PyInstaller spec files
+        )
+        # Common extensionless files that should be indexed
+        self.extensionless_files = ("LICENSE", "README", "Dockerfile", "Vagrantfile", "Procfile")
+
 
     def index_paths(self, paths: list[str]):
         """Indexes a list of paths, which can be directories or individual files."""
@@ -26,22 +37,31 @@ class CodeIndexer:
             if os.path.isdir(path):
                 # Recursively walk directories
                 for root, _, files in os.walk(path):
+                    # Robust Exclusion Check: Skip well-known build/system folders based on directory name
+                    if any(segment.startswith(('.', 'venv', 'env', 'build', 'dist', 'data')) for segment in root.split(os.sep)):
+                         continue
+
                     for file in files:
                         file_path = os.path.join(root, file)
-                        # Check ignore patterns and extension
-                        if file.endswith(self.extensions) and "venv" not in root and ".git" not in root:
+                        file_name = os.path.basename(file_path)
+                        
+                        # Check if it matches supported extensions (case insensitive)
+                        is_supported = file_name.lower().endswith(self.supported_extensions)
+                        # Check for extensionless files
+                        is_extensionless = file_name in self.extensionless_files and not os.path.splitext(file_name)[1]
+                        
+                        if is_supported or is_extensionless:
                             all_files_to_index.append(file_path)
+                            
             elif os.path.isfile(path):
-                # Add individual files directly, provided they match extensions
-                if path.endswith(self.extensions):
-                    all_files_to_index.append(path)
-                else:
-                    console.print(f"[bold yellow]Skipping file[/bold yellow] {path}: unsupported extension.")
+                # If a file is explicitly selected, we generally allow it, 
+                # relying on the chunking process to handle the content.
+                all_files_to_index.append(path) 
             else:
                 console.print(f"[bold red]Error:[/bold red] Path '{path}' is not a valid directory or file.")
 
         if not all_files_to_index:
-            console.print("[bold red]No code files found[/bold red] or they were filtered out.")
+            console.print("[bold red]No files found[/bold red] or they were filtered out.")
             return
 
         # Second pass: Process and chunk files with progress bar
@@ -54,8 +74,7 @@ class CodeIndexer:
                     content = f.read()
                     
                     # Use relative path if a common base exists, otherwise use the full path
-                    if base_path:
-                         # Ensure the path is relative to the common root for cleaner context output
+                    if base_path and base_path != os.path.dirname(file_path): 
                          relative_path = os.path.relpath(file_path, base_path)
                     else:
                          relative_path = file_path # Single file/no common root
@@ -63,6 +82,7 @@ class CodeIndexer:
                     chunks = chunk_text(content, relative_path)
                     all_chunks.extend(chunks)
             except Exception as e:
+                # This often happens with binary files or files with odd permissions
                 console.print(f"[bold yellow]Skipping file[/bold yellow] {file_path} due to error: {e}")
 
         if all_chunks:
