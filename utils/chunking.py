@@ -3,20 +3,20 @@ from config import CHUNK_SIZE, CHUNK_OVERLAP, EMBED_MODEL
 import numpy as np
 import sys
 import os
-from pathlib import Path # NEW IMPORT
+from pathlib import Path
 
 # Load the embedding model globally once
-# --- MODIFIED FOR PYINSTALLER ---
+# --- MODIFIED FOR LOCAL LOADING AND PYINSTALLER ---
 def get_model_path():
-    """Determines the correct model path based on PyInstaller environment."""
+    """Determines the correct model path based on local setup or PyInstaller environment."""
     if getattr(sys, 'frozen', False):
-        # Running from PyInstaller bundle: Model is bundled under the relative path
+        # Running from PyInstaller bundle: Model is bundled inside sys._MEIPASS
         base_path = Path(sys._MEIPASS)
-        # Target path defined in PyInstaller --add-data flag
-        return str(base_path / "sentence_transformer_cache" / EMBED_MODEL)
+        # The model is now bundled under 'models/' (matching the new --add-data target)
+        return str(base_path / "models" / EMBED_MODEL) # <--- CHANGE HERE
     else:
-        # Running normally (model will be downloaded/cached conventionally)
-        return EMBED_MODEL
+        # Running normally, load from local 'models/' directory
+        return str(Path("models") / EMBED_MODEL) # <--- CHANGE HERE
 
 try:
     model = SentenceTransformer(get_model_path())
