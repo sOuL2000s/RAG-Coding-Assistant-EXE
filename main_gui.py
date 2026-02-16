@@ -11,8 +11,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtGui import QIcon
 from concurrent.futures import ThreadPoolExecutor
+from typing import Callable # Added Callable import
 
 # Import RAG components
+from gui.components import StatusMetrics, ConsoleLogView # Add new component imports
 from llm.gemini_client import GeminiClient
 from retrieval.retriever import Retriever
 from memory.chat_memory import ChatMemory, MEMORY_DIR, CHAT_META_FILE
@@ -20,7 +22,7 @@ from indexing.code_indexer import CodeIndexer
 from config_manager import config_manager
 from gui.chat_widget import ChatViewWidget
 from gui.setup_dialog import SetupDialog
-from themes import THEMES, DEFAULT_THEME # NEW IMPORT
+from themes import THEMES, DEFAULT_THEME # Ensure DEFAULT_THEME is imported
 from models import DEFAULT_MODEL # Ensure DEFAULT_MODEL is imported
 
 # Ensure data directory exists
@@ -61,18 +63,21 @@ class RAGWorker(QThread):
 class IndexWorker(QThread):
     finished = Signal(str)
     error = Signal(str)
+    progress_update = Signal(str) # NEW signal for real-time updates
 
-    def __init__(self, paths: list[str], indexer):
+    def __init__(self, paths: list[str], indexer, progress_callback: Callable[[str], None]):
         super().__init__()
         # paths is now a list of directories or files
         self.paths = paths 
         self.indexer = indexer
+        self.progress_callback = progress_callback # Callable passed to synchronous indexer method
 
     def run(self):
         try:
-            # Call the updated indexer method
-            self.indexer.index_paths(self.paths) 
-            self.finished.emit(f"Indexing successful! Total chunks: {len(self.indexer.store.texts)}")
+            # Call the updated indexer method with the synchronous callback
+            self.indexer.index_paths(self.paths, self.progress_callback) 
+            # The final success message is handled by the indexer's callback
+            self.finished.emit("Indexing process finished.") # Trigger _index_finished to update retriever/UI
         except Exception as e:
             self.error.emit(f"Indexing Failed: {e}")
 
@@ -94,20 +99,57 @@ class RAGCoderWindow(QMainWindow):
         self.memory = ChatMemory() # Initialize memory first
         self.indexer = CodeIndexer()
         
+        # Store initial metrics data here
+        self._initial_chunk_count = 0
+        self._initial_rag_ready = False
+        
+        # New components initialized
+        self.status_metrics = None
+        self.console_log = None
+        
         # Connect proxy signals to slots
         self.rag_finished_signal.connect(self._rag_finished)
         self.rag_error_signal.connect(self._rag_error)
         
-        self._setup_rag() # Configure RAG components
+        # 1. Setup RAG components (creates indexer/retriever, calculates chunks)
+        self._setup_rag() 
+        
+        # 2. Setup UI (creates self.status_metrics)
         self._setup_ui()
+
+        # 3. Apply stored metrics after the UI is ready
+        self._apply_initial_metrics()
+        
         self.apply_theme(config_manager.get_current_theme()) # Apply saved theme
+        
+    def _apply_initial_metrics(self):
+        """Applies chunk count and ready status once the metrics widget exists."""
+        if self.status_metrics and self._initial_rag_ready:
+            if self.gemini:
+                self.status_metrics.update_metrics(
+                    total_chunks=self._initial_chunk_count, 
+                    memory_state="Ready",
+                    model=self.gemini.model_name
+                )
+                self.status_update_signal.emit(f"RAG Ready. Model: {self.gemini.model_name}. Chunks: {self._initial_chunk_count}")
+
 
     # --- UI Setup ---
+
+    def _handle_status_update_log(self, message: str):
+        """Handles status updates by writing them to the ConsoleLogView and the temporary status bar."""
+        # 1. Update Console Log
+        if self.console_log:
+            self.console_log.log_message(message)
+        
+        # 2. Update QStatusBar briefly (Show for 3 seconds)
+        self.status_bar.showMessage(message, 3000)
 
     def _setup_ui(self):
         self._create_menu()
         self.status_bar = self.statusBar() # Use standard status bar
-        self.status_update_signal.connect(self.status_bar.showMessage) # Connect status signal here
+        # Connect status signal to the dedicated log viewer handler
+        self.status_update_signal.connect(self._handle_status_update_log) 
 
         # Main Splitter: Sidebar and Main Content
         main_splitter = QSplitter(Qt.Horizontal)
@@ -123,7 +165,8 @@ class RAGCoderWindow(QMainWindow):
         chat_layout.setContentsMargins(0, 0, 0, 0)
         chat_layout.setSpacing(0)
         
-        self.chat_view = ChatViewWidget()
+        # Pass the status update signal down to ChatView for bubbles to use the clipboard confirmation
+        self.chat_view = ChatViewWidget(status_signal=self.status_update_signal)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(self.chat_view)
@@ -142,48 +185,80 @@ class RAGCoderWindow(QMainWindow):
     def _create_sidebar(self):
         sidebar = QWidget()
         sidebar.setObjectName("sidebar_container")
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Use a Vertical Splitter for Chat Management (top) and Status/Log (bottom)
+        sidebar_splitter = QSplitter(Qt.Vertical)
+        
+        # --- 1. Chat Management Container (Top Section) ---
+        chat_management_widget = QWidget()
+        chat_management_layout = QVBoxLayout(chat_management_widget)
+        chat_management_layout.setContentsMargins(10, 10, 10, 10)
         
         # New Chat Button
         new_chat_btn = QPushButton("✨ New Chat")
         new_chat_btn.setObjectName("new_chat_btn")
         new_chat_btn.clicked.connect(self._new_chat_session)
-        layout.addWidget(new_chat_btn)
+        chat_management_layout.addWidget(new_chat_btn)
 
         # Chat List
-        layout.addWidget(QLabel("<b>Chat History</b>:"))
+        chat_management_layout.addWidget(QLabel("<b>Chat History</b>:"))
         self.chat_list = QListWidget()
         self.chat_list.setObjectName("chat_list_widget")
         self.chat_list.itemClicked.connect(self._switch_chat_session)
         self.chat_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.chat_list.customContextMenuRequested.connect(self._show_chat_context_menu)
-        layout.addWidget(self.chat_list)
+        chat_management_layout.addWidget(self.chat_list)
         
         self._refresh_chat_list()
         
         # Theme Selector
-        layout.addWidget(QLabel("<b>Coding Theme</b>:"))
+        chat_management_layout.addWidget(QLabel("<b>Coding Theme</b>:"))
         self.theme_combo = QComboBox()
         for name in THEMES.keys():
             self.theme_combo.addItem(name, name)
         self.theme_combo.setCurrentText(config_manager.get_current_theme())
         self.theme_combo.currentTextChanged.connect(self.apply_theme)
-        layout.addWidget(self.theme_combo)
-
-        # Space filler
-        layout.addStretch(1)
-
-        # Clear Chat Button (Clears current conversation)
-        clear_chat_btn = QPushButton("Clear Current Chat")
-        clear_chat_btn.clicked.connect(self._clear_active_chat)
-        layout.addWidget(clear_chat_btn)
-
-        # Delete ALL Chats Button
+        chat_management_layout.addWidget(self.theme_combo)
+        
+        # Clear Chat Buttons
+        chat_management_layout.addWidget(QPushButton("Clear Current Chat", clicked=self._clear_active_chat))
         delete_all_chats_btn = QPushButton("Delete ALL Chats")
         delete_all_chats_btn.setObjectName("delete_all_chats_btn")
         delete_all_chats_btn.clicked.connect(self._clear_all_chat_history)
-        layout.addWidget(delete_all_chats_btn)
+        chat_management_layout.addWidget(delete_all_chats_btn)
+
+        # Add Chat Management to the splitter
+        sidebar_splitter.addWidget(chat_management_widget)
+        
+        # --- 2. Status and Log Container (Bottom Section) ---
+        status_log_widget = QWidget()
+        status_log_layout = QVBoxLayout(status_log_widget)
+        status_log_layout.setContentsMargins(10, 0, 10, 10) # Less top margin
+        
+        # Status Metrics
+        status_log_layout.addWidget(QLabel("<b>System Status</b>:"))
+        self.status_metrics = StatusMetrics() 
+        self.status_metrics.setObjectName("status_metrics")
+        status_log_layout.addWidget(self.status_metrics)
+        
+        status_log_layout.addWidget(QLabel("<b>Console Log</b>:"))
+        
+        # Console Log View
+        self.console_log = ConsoleLogView()
+        self.console_log.setObjectName("console_log")
+        self.console_log.setMaximumHeight(200) # Give the log a reasonable max height
+        status_log_layout.addWidget(self.console_log)
+        
+        # Add Status/Log to the splitter
+        sidebar_splitter.addWidget(status_log_widget)
+        
+        # Set splitter sizes (e.g., prioritize chat management area)
+        sidebar_splitter.setSizes([500, 300]) 
+
+        # Final layout uses the splitter as the main element
+        main_layout = QVBoxLayout(sidebar)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(sidebar_splitter)
 
         return sidebar
 
@@ -456,6 +531,11 @@ class RAGCoderWindow(QMainWindow):
     def _setup_rag(self):
         """Initializes RAG components based on saved configuration."""
         keys = config_manager.get_keys()
+        
+        # Store chunk count regardless of key status
+        self._initial_chunk_count = len(self.indexer.store.texts)
+        self._initial_rag_ready = False
+        
         if not keys:
             self.status_update_signal.emit("SETUP REQUIRED: Please add API keys in Settings menu.")
             # If no keys on startup, force the setup dialog
@@ -466,15 +546,24 @@ class RAGCoderWindow(QMainWindow):
         try:
             self.gemini = GeminiClient()
             self.retriever = Retriever()
-            self.status_update_signal.emit(f"RAG Ready. Model: {self.gemini.model_name}. Chunks: {len(self.indexer.store.texts)}")
+            
+            # Indicate RAG is ready
+            self._initial_rag_ready = True
+            
+            # Note: UI updates handled by _apply_initial_metrics after UI setup.
+            
         except Exception as e:
             QMessageBox.critical(self, "RAG Initialization Error", f"Could not initialize Gemini Client: {e}")
             self.status_update_signal.emit("ERROR: Check API Keys.")
+            # If metrics widget exists (i.e., this was called outside of initial __init__ flow), update error state
+            if self.status_metrics:
+                self.status_metrics.update_metrics(memory_state="API Error")
 
     def _load_chat_history(self):
         history = self.memory.load()
         for msg in history:
-            self.chat_view.add_message(msg['role'], msg['content'])
+            # Pass the status signal when loading messages
+            self.chat_view.add_message(msg['role'], msg['content'], status_signal=self.status_update_signal)
         self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
             
     def _show_setup_dialog(self):
@@ -504,7 +593,7 @@ class RAGCoderWindow(QMainWindow):
             return
 
         # 1. Display user message
-        self.chat_view.add_message("user", query)
+        self.chat_view.add_message("user", query, status_signal=self.status_update_signal)
         self.memory.save("user", query)
         self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
         
@@ -541,7 +630,8 @@ class RAGCoderWindow(QMainWindow):
         self.rag_worker.start()
 
     def _rag_finished(self, role, content):
-        self.chat_view.add_message(role, content)
+        # Pass the status signal to the add_message function
+        self.chat_view.add_message(role, content, status_signal=self.status_update_signal)
         self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum())
         
     def _rag_error(self, message):
@@ -550,22 +640,41 @@ class RAGCoderWindow(QMainWindow):
     def _start_index_worker(self, paths: list[str]):
         if not paths: return 
         
-        self.index_worker = IndexWorker(paths, self.indexer) # Use the list of paths
+        display_path = paths[0] if len(paths) == 1 else f"{len(paths)} items"
+        
+        # Update Status Metrics before starting
+        if self.status_metrics:
+            self.status_metrics.update_metrics(memory_state="Indexing...", indexing_path=display_path)
+            
+        # Define the synchronous callback function to emit a signal back to the UI thread
+        def progress_callback_sync(message: str):
+            # This function runs in the worker thread, emitting a signal to the UI thread
+            self.index_worker.progress_update.emit(message)
+
+        # Initialize worker and pass the callback function
+        self.index_worker = IndexWorker(paths, self.indexer, progress_callback_sync)
         self.index_worker.finished.connect(self._index_finished)
         self.index_worker.error.connect(self._index_error)
+        self.index_worker.progress_update.connect(self.status_update_signal) # Connect new signal for real-time updates
         
-        display_path = paths[0] if len(paths) == 1 else f"{len(paths)} items"
         self.status_update_signal.emit(f"Indexing started for: {display_path}")
         self.index_worker.start()
 
     def _index_finished(self, message):
-        self.status_update_signal.emit(message)
+        total_chunks = len(self.indexer.store.texts)
+        self.status_update_signal.emit(f"{message} Total chunks: {total_chunks}")
+        
+        if self.status_metrics:
+            self.status_metrics.update_metrics(total_chunks=total_chunks, memory_state="Ready", indexing_path="")
+            
         # Re-initialize retriever to recognize new index data
         self.retriever = Retriever()
 
     def _index_error(self, message):
         QMessageBox.critical(self, "Indexing Error", message)
         self.status_update_signal.emit("Indexing failed.")
+        if self.status_metrics:
+            self.status_metrics.update_metrics(memory_state="Error", indexing_path="")
 
 # --- Prompt Builder ---
 def build_rag_prompt(query, retrieved_context, history):

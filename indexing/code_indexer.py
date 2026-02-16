@@ -1,3 +1,4 @@
+from typing import Callable # New import required
 import os
 from tqdm import tqdm
 from utils.chunking import chunk_text, embed
@@ -23,12 +24,14 @@ class CodeIndexer:
         self.extensionless_files = ("LICENSE", "README", "Dockerfile", "Vagrantfile", "Procfile")
 
 
-    def index_paths(self, paths: list[str]):
-        """Indexes a list of paths, which can be directories or individual files."""
+    def index_paths(self, paths: list[str], progress_callback: Callable[[str], None]):
+        """Indexes a list of paths, which can be directories or individual files,
+        reporting progress via callback."""
         if not paths:
+            progress_callback("[bold red]No paths provided for indexing.[/bold red]")
             return
 
-        console.print(f"\n[bold blue]Starting indexing process...[/bold blue] ({len(paths)} initial paths)")
+        progress_callback(f"[bold blue]Starting directory traversal...[/bold blue] Found {len(paths)} initial paths.")
         all_chunks = []
         all_files_to_index = []
 
@@ -58,9 +61,11 @@ class CodeIndexer:
                 # relying on the chunking process to handle the content.
                 all_files_to_index.append(path) 
             else:
+                progress_callback(f"[bold red]Error:[/bold red] Path '{path}' is not a valid directory or file.")
                 console.print(f"[bold red]Error:[/bold red] Path '{path}' is not a valid directory or file.")
 
         if not all_files_to_index:
+            progress_callback("[bold red]No supported files found to index.[/bold red]")
             console.print("[bold red]No files found[/bold red] or they were filtered out.")
             return
 
@@ -79,16 +84,24 @@ class CodeIndexer:
                     else:
                          relative_path = file_path # Single file/no common root
 
+                    progress_callback(f"[bold magenta]INDEXER:[/bold magenta] Processing {relative_path}") # Real-time file update
+
                     chunks = chunk_text(content, relative_path)
                     all_chunks.extend(chunks)
+                    
             except Exception as e:
                 # This often happens with binary files or files with odd permissions
+                progress_callback(f"[bold yellow]Skipping file[/bold yellow] {file_path} due to error: {e}")
                 console.print(f"[bold yellow]Skipping file[/bold yellow] {file_path} due to error: {e}")
 
         if all_chunks:
             # Batch embedding and adding to FAISS
             embeddings = embed(all_chunks)
             self.store.add(embeddings, all_chunks)
+            progress_callback(f"[bold green]Indexing successful![/bold green] Total chunks: {len(self.store.texts)}")
             console.print(f"\n[bold green]Indexing Complete![/bold green] Total chunks added: {len(all_chunks)}")
         else:
+            progress_callback("[bold yellow]No chunks were generated.[/bold yellow]")
             console.print("[bold yellow]No chunks were generated.[/bold yellow]")
+        
+        return len(all_chunks) # Ensure integer return value
